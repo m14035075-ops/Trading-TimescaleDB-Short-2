@@ -1,7 +1,16 @@
 -- =====================================================================
--- NSE Tick Collector — TimescaleDB Schema  (v3 — review fixes round 2)
+-- NSE Tick Collector — TimescaleDB Schema  (v4 — round-3 review fixes)
 -- =====================================================================
--- एक बार चलाएं:  psql -U postgres -d marketdata -f schema.sql
+--
+-- नए install पर:
+--     psql -U postgres -d marketdata -f schema.sql
+--
+-- पुराने (v2/v3) DB से upgrade पर — पहले एक बार:
+--     DROP MATERIALIZED VIEW IF EXISTS ohlc_1s CASCADE;
+--     DROP VIEW IF EXISTS v_quotes_1m;
+--     DROP VIEW IF EXISTS v_quotes_1m_raw;
+-- फिर schema.sql चलाएँ। (नए columns ALTER से idempotent जुड़ जाएँगे।)
+--
 -- TimescaleDB extension पहले से installed होनी चाहिए।
 -- =====================================================================
 
@@ -9,9 +18,6 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 -- ---------------------------------------------------------------------
 -- 1) ticks  — हर WebSocket tick (quote OR depth)
---    stream_type: 'quote' | 'depth'   (कौन से subscription से आया)
---    tick_volume: इस tick की actual quantity (cumulative volume का delta)
---    depth      : Level-2 order book snapshot (JSONB) — सिर्फ़ depth mode में
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS ticks (
     ts          TIMESTAMPTZ      NOT NULL,
@@ -19,17 +25,28 @@ CREATE TABLE IF NOT EXISTS ticks (
     symbol      TEXT             NOT NULL,
     stream_type TEXT             NOT NULL DEFAULT 'quote',
     ltp         DOUBLE PRECISION NOT NULL,
-    volume      BIGINT,                 -- cumulative day volume (broker)
-    tick_volume BIGINT,                 -- delta — इस tick की quantity
+    volume      BIGINT,
+    tick_volume BIGINT,
     bid         DOUBLE PRECISION,
     ask         DOUBLE PRECISION,
     open        DOUBLE PRECISION,
     high        DOUBLE PRECISION,
     low         DOUBLE PRECISION,
-    close       DOUBLE PRECISION,       -- previous close
-    depth       JSONB,                  -- Level-2 full order book
-    raw         JSONB                   -- backup payload (optional)
+    close       DOUBLE PRECISION,
+    depth       JSONB,
+    raw         JSONB,
+    tick_uid    TEXT
 );
+
+-- Idempotent migration: पुराने schemas से columns missing हों तो जोड़ दे
+ALTER TABLE ticks ADD COLUMN IF NOT EXISTS stream_type TEXT;
+ALTER TABLE ticks ALTER COLUMN stream_type SET DEFAULT 'quote';
+UPDATE ticks SET stream_type = 'quote' WHERE stream_type IS NULL;
+ALTER TABLE ticks ALTER COLUMN stream_type SET NOT NULL;
+
+ALTER TABLE ticks ADD COLUMN IF NOT EXISTS tick_volume BIGINT;
+ALTER TABLE ticks ADD COLUMN IF NOT EXISTS depth       JSONB;
+ALTER TABLE ticks ADD COLUMN IF NOT EXISTS tick_uid    TEXT;
 
 SELECT create_hypertable(
     'ticks', 'ts',
@@ -40,11 +57,18 @@ SELECT create_hypertable(
 CREATE INDEX IF NOT EXISTS idx_ticks_ex_sym_ts
     ON ticks (exchange, symbol, ts DESC);
 
+-- Spool replay duplicate से बचाव: ts + tick_uid पर unique
+-- (TimescaleDB hypertable में partition column ts include होना ज़रूरी)
+CREATE UNIQUE INDEX IF NOT EXISTS uq_ticks_dedupe
+    ON ticks (ts, tick_uid);
+
 -- ---------------------------------------------------------------------
--- 2) 1-second OHLCV continuous aggregate
---    materialized_only = false  →  TimescaleDB 2.13+ में real-time
---    aggregation enable होती है (latest seconds query में दिखें)।
---    Volume = sum(tick_volume) — सही formula (per-tick delta का sum)।
+-- 2) ohlc_1s  — 1-second OHLCV continuous aggregate
+--
+--    Note: CAGG यह assume करता है कि एक समय पर सिर्फ़ एक mode चल रहा है
+--    (MODE=quote XOR MODE=depth)। दोनों stream_types का LTP/volume same
+--    cumulative counter से आता है, इसलिए mixing harmless है, बस tick_count
+--    inflate हो सकता है। forensic detail चाहिए तो ticks table से query करें।
 -- ---------------------------------------------------------------------
 CREATE MATERIALIZED VIEW IF NOT EXISTS ohlc_1s
 WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
@@ -85,7 +109,7 @@ SELECT add_compression_policy('ticks', INTERVAL '7 days', if_not_exists => TRUE)
 -- SELECT add_retention_policy('ticks', INTERVAL '365 days', if_not_exists => TRUE);
 
 -- ---------------------------------------------------------------------
--- 5) collector_gaps — disconnect periods log (per-symbol retry)
+-- 5) collector_gaps — disconnect periods (per-symbol retry)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS collector_gaps (
     id              BIGSERIAL    PRIMARY KEY,
@@ -103,7 +127,7 @@ CREATE INDEX IF NOT EXISTS idx_gaps_unfilled
     ON collector_gaps (started_at) WHERE filled = FALSE;
 
 -- ---------------------------------------------------------------------
--- 6) ohlc_1m_filled — gap_filler.py की भरी हुई 1-min bars
+-- 6) ohlc_1m_filled — gap_filler.py history bars
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS ohlc_1m_filled (
     ts          TIMESTAMPTZ NOT NULL,
@@ -125,15 +149,19 @@ SELECT create_hypertable(
 );
 
 -- ---------------------------------------------------------------------
--- 7) v_quotes_1m  — smart 1-minute feed
+-- 7) Views: v_quotes_1m_raw (forensic — duplicates allowed)
+--           v_quotes_1m     (clean — DISTINCT ON + quality priority)
+--
 --    quality column ML training में filter के लिए:
---      'full'    → live 1-sec data से aggregate, अच्छी coverage (≥ 50 sec)
---      'partial' → live data था पर coverage कम (<50 sec) — careful use
+--      'full'    → live data, कोई gap overlap नहीं, tick coverage अच्छी
+--      'partial' → live data था पर इस minute में disconnect-gap overlap
+--      'sparse'  → live data था, gap नहीं, लेकिन कम trades (low liquidity)
 --      'history' → disconnect period में history API से भरा
 --
---    Strict ML training के लिए:  WHERE quality IN ('full', 'history')
+--    Strict ML feed के लिए:  v_quotes_1m WHERE quality IN ('full','history')
+--    Low-liquidity OK:        v_quotes_1m WHERE quality != 'partial'
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE VIEW v_quotes_1m AS
+CREATE OR REPLACE VIEW v_quotes_1m_raw AS
 WITH live_1m AS (
     SELECT
         time_bucket('1 minute', bucket) AS ts,
@@ -147,21 +175,54 @@ WITH live_1m AS (
         COUNT(*)                        AS sec_count
     FROM ohlc_1s
     GROUP BY 1, 2, 3
+),
+gap_minutes AS (
+    -- collector_gaps के सारे minutes (1-min boundary पर expand)
+    SELECT DISTINCT
+        time_bucket('1 minute', g) AS ts
+    FROM (
+        SELECT generate_series(started_at, ended_at, '1 minute'::interval) AS g
+        FROM collector_gaps
+    ) x
 )
+-- live row (always present) — quality gap-overlap और sec_count से
 SELECT
-    ts, exchange, symbol, open, high, low, close, volume,
+    lm.ts, lm.exchange, lm.symbol,
+    lm.open, lm.high, lm.low, lm.close, lm.volume,
     'tick' AS source,
-    CASE WHEN sec_count >= 50 THEN 'full' ELSE 'partial' END AS quality
-FROM   live_1m
+    CASE
+        WHEN gm.ts IS NOT NULL              THEN 'partial'
+        WHEN lm.sec_count >= 10             THEN 'full'
+        ELSE                                     'sparse'
+    END AS quality
+FROM live_1m lm
+LEFT JOIN gap_minutes gm ON gm.ts = lm.ts
 UNION ALL
+-- history row — सिर्फ़ तब जब live data नहीं है, या live partial है
 SELECT
-    f.ts, f.exchange, f.symbol, f.open, f.high, f.low, f.close, f.volume,
+    f.ts, f.exchange, f.symbol,
+    f.open, f.high, f.low, f.close, f.volume,
     f.source,
     'history' AS quality
-FROM   ohlc_1m_filled f
+FROM ohlc_1m_filled f
 LEFT JOIN live_1m lm
        ON lm.ts       = date_trunc('minute', f.ts)
       AND lm.exchange = f.exchange
       AND lm.symbol   = f.symbol
-      AND lm.sec_count >= 50         -- सिर्फ़ "full" live minutes को override मानो
-WHERE  lm.ts IS NULL;
+LEFT JOIN gap_minutes gm
+       ON gm.ts       = date_trunc('minute', f.ts);
+-- नोट: यहाँ duplicate possible है (live partial + history) — clean view
+-- नीचे DISTINCT ON से एक ही row देता है, quality priority के साथ।
+
+-- Clean view — ML training के लिए recommended
+CREATE OR REPLACE VIEW v_quotes_1m AS
+SELECT DISTINCT ON (ts, exchange, symbol)
+       ts, exchange, symbol, open, high, low, close, volume, source, quality
+FROM   v_quotes_1m_raw
+ORDER  BY ts, exchange, symbol,
+    CASE quality
+        WHEN 'full'    THEN 1
+        WHEN 'history' THEN 2
+        WHEN 'sparse'  THEN 3
+        WHEN 'partial' THEN 4
+    END;

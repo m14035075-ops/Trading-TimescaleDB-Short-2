@@ -1,15 +1,15 @@
 """
-Gap Filler  (v3 — review fixes round 2)
+Gap Filler  (v4 — round-3 review fixes)
 ========================================
 collector_gaps से unfilled disconnect periods लेकर 1-min OHLC bars
 ohlc_1m_filled में डालता है।
 
-v3 sudhar:
-  H. Partial minute fix: filter minute-floor par (पहली partial minute miss नहीं)
-  I. No-rows-in-market-hours = failure (अब "data नहीं आया" को skip नहीं करते)
-  J. Multi-day gap → day-by-day API chunking (broker 1m limit hit न हो)
-  + pool.close() हमेशा finally में
-  + unused defaultdict import हटाया
+v4 sudhar:
+  * NSE holidays via OpenAlgo API cache (weekday-only fallback)
+  * Multi-day gap → day-by-day chunking
+  * Partial first/last minute floor-filter
+  * Market-hours overlap = failure (with holiday awareness)
+  * pool.close() always in finally
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import argparse
 import logging
 import os
 from datetime import date, datetime, time as dtime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -83,6 +84,58 @@ WHERE  id = %s
 
 
 # ---------------------------------------------------------------------------
+# NSE holiday cache (OpenAlgo से लाते हैं; fallback weekday-only)
+# ---------------------------------------------------------------------------
+_HOLIDAYS: set[date] | None = None
+
+
+def _load_holidays(client) -> set[date]:
+    global _HOLIDAYS
+    if _HOLIDAYS is not None:
+        return _HOLIDAYS
+    hols: set[date] = set()
+    years = {datetime.now(IST).year, datetime.now(IST).year - 1}
+    for y in years:
+        try:
+            resp = client.holidays(year=y)
+        except Exception as e:                                   # noqa: BLE001
+            log.warning("holidays(%d) API fail: %s", y, e)
+            continue
+        items: Any = None
+        if isinstance(resp, dict):
+            items = resp.get("data") or resp.get("holidays") or list(resp.values())
+        elif isinstance(resp, list):
+            items = resp
+        if not items:
+            continue
+        for h in items:
+            d_str = None
+            if isinstance(h, dict):
+                d_str = h.get("date") or h.get("holiday_date") or h.get("day")
+            elif isinstance(h, str):
+                d_str = h
+            if not d_str:
+                continue
+            try:
+                hols.add(datetime.fromisoformat(str(d_str)[:10]).date())
+            except (ValueError, TypeError):
+                pass
+    _HOLIDAYS = hols
+    log.info("loaded %d NSE holidays (%s)", len(hols),
+             "via API" if hols else "fallback weekday-only")
+    return hols
+
+
+def is_trading_day(d: date, client=None) -> bool:
+    if d.weekday() > 4:
+        return False
+    if client is not None:
+        if d in _load_holidays(client):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 def load_symbols(path: str) -> list[str]:
     return [s.strip() for s in Path(path).read_text().splitlines()
             if s.strip() and not s.strip().startswith("#")]
@@ -99,22 +152,18 @@ def date_range(d_start: date, d_end: date) -> Iterator[date]:
         d += timedelta(days=1)
 
 
-def gap_overlaps_market_hours(start: datetime, end: datetime) -> bool:
-    """
-    Gap window में कहीं भी कोई market-hours minute है? (कम-से-कम एक trading day
-    और उस day में 9:15-15:30 का कोई हिस्सा।)
-    """
+def gap_overlaps_market_hours(start: datetime, end: datetime, client=None) -> bool:
+    """Holiday-aware market-hours overlap check."""
     cur = start.astimezone(IST)
     end_ist = end.astimezone(IST)
     while cur <= end_ist:
-        # weekend skip
-        if cur.weekday() <= 4:
+        if is_trading_day(cur.date(), client):
             day_open  = cur.replace(hour=9,  minute=15, second=0, microsecond=0)
             day_close = cur.replace(hour=15, minute=30, second=0, microsecond=0)
-            # any overlap
             if start.astimezone(IST) <= day_close and end_ist >= day_open:
                 return True
-        cur = (cur + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        cur = (cur + timedelta(days=1)).replace(hour=0, minute=0,
+                                                second=0, microsecond=0)
     return False
 
 
@@ -135,11 +184,6 @@ def fetch_history(client, symbol: str, sd: str, ed: str) -> Any | None:
 
 def df_rows_in_window(df, start: datetime, end: datetime,
                       symbol: str) -> list[tuple]:
-    """
-    DataFrame से gap window के bars निकालो।
-    Window minute-boundary पर floor किया जाता है ताकि partial first/last minute
-    drop न हो। Naive timestamps IST मानकर UTC में।
-    """
     start_floor = floor_minute(start)
     end_floor   = floor_minute(end)
     rows: list[tuple] = []
@@ -164,15 +208,12 @@ def df_rows_in_window(df, start: datetime, end: datetime,
 
 def fetch_history_chunked(client, symbol: str,
                           start: datetime, end: datetime) -> list[tuple]:
-    """
-    Multi-day gap → day-by-day API call (broker 1m limit avoid).
-    हर day का API result merge करके gap-window-filtered tuples लौटाओ।
-    """
+    """Multi-day gap → day-by-day API call (broker 1m limit avoid)."""
     start_ist = start.astimezone(IST).date()
     end_ist   = end.astimezone(IST).date()
     all_rows: list[tuple] = []
     for day in date_range(start_ist, end_ist):
-        if day.weekday() > 4:                # Sat/Sun skip
+        if not is_trading_day(day, client):
             continue
         sd = ed = day.isoformat()
         df = fetch_history(client, symbol, sd, ed)
@@ -184,28 +225,21 @@ def fetch_history_chunked(client, symbol: str,
 
 def fill_one_gap(client, pool, gid: int, start: datetime, end: datetime,
                  symbols: list[str]) -> tuple[int, list[str], str | None]:
-    """
-    Returns: (inserted_rows, failed_symbol_list, last_error_or_None)
-    """
     inserted = 0
     failed: list[str] = []
     last_err: str | None = None
-    market_gap = gap_overlaps_market_hours(start, end)
+    market_gap = gap_overlaps_market_hours(start, end, client)
 
     for sym in symbols:
         rows = fetch_history_chunked(client, sym, start, end)
-
         if not rows:
-            # API fail OR window में data नहीं
             if market_gap:
-                # market hours में 0 rows = data नहीं मिला → failure
                 failed.append(sym)
                 last_err = f"no bars in market-hours window for {sym}"
-                log.warning("gap %d | %s: 0 bars in market-hours gap", gid, sym)
+                log.warning("gap %d | %s: 0 bars in market-hours", gid, sym)
             else:
-                log.debug("gap %d | %s: 0 bars (off-hours gap, OK)", gid, sym)
+                log.debug("gap %d | %s: 0 bars (off-hours/holiday — OK)", gid, sym)
             continue
-
         try:
             with pool.connection() as con, con.cursor() as cur:
                 cur.executemany(INSERT_BAR, rows)
@@ -224,7 +258,7 @@ def main() -> None:
     ap.add_argument("--today", action="store_true",
                     help="सिर्फ़ आज के unfilled gaps")
     ap.add_argument("--retry", action="store_true",
-                    help="सिर्फ़ वो gaps जिनमें पहले attempts हुए हैं")
+                    help="जिनमें पहले attempts हुए हैं वही")
     args = ap.parse_args()
 
     symbols = load_symbols(SYMBOLS_FILE)
@@ -249,6 +283,7 @@ def main() -> None:
 
         log.info("processing %d gaps", len(gaps))
         client = api(api_key=OPENALGO_API_KEY, host=OPENALGO_HOST)
+        _load_holidays(client)                                    # warm cache
 
         total_rows = 0
         for gid, start, end, reason, attempts, prev_failed in gaps:
