@@ -182,12 +182,22 @@ def seed_last_cum_vol(pool: ConnectionPool) -> None:
 
 
 def get_last_db_tick_ts(pool: ConnectionPool) -> datetime | None:
-    """v5 FIX: startup पर last DB tick का time लाओ → auto gap recording।"""
+    """
+    v6 FIX (ChatGPT #5): per-symbol min(max(ts)) — सबसे stale symbol का
+    last-seen time वाला conservative gap रिकॉर्ड करते हैं ताकि कोई
+    symbol coverage छूटे न।
+    """
     try:
         with pool.connection() as con, con.cursor() as cur:
-            cur.execute(
-                "SELECT max(ts) FROM ticks WHERE ts >= now() - INTERVAL '7 days'"
-            )
+            cur.execute("""
+                WITH per_symbol AS (
+                    SELECT symbol, max(ts) AS max_ts
+                    FROM   ticks
+                    WHERE  ts >= now() - INTERVAL '7 days'
+                    GROUP  BY symbol
+                )
+                SELECT min(max_ts) FROM per_symbol
+            """)
             row = cur.fetchone()
         return row[0] if row and row[0] else None
     except Exception as e:                                      # noqa: BLE001
@@ -360,12 +370,14 @@ def _norm_float(v: Any) -> str:
 
 
 def _hash_jsonb(j: Any) -> str:
+    """v6 FIX (Qwen): allow_nan=True — broker के NaN/Inf floats crash न करें।"""
     if j is None:
         return ""
     obj = j.obj if isinstance(j, Jsonb) else j
     try:
         return hashlib.sha256(
-            json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
+            json.dumps(obj, sort_keys=True, default=str,
+                       allow_nan=True).encode("utf-8")
         ).hexdigest()[:16]
     except (TypeError, ValueError):
         return "<unhashable>"
@@ -563,6 +575,7 @@ def replay_spool(pool: ConnectionPool) -> None:
 
 
 def replay_gap_spool(pool: ConnectionPool) -> None:
+    """v6 FIX (Qwen): single-transaction per file (no N+1 connections)."""
     if not SPOOL_DIR.exists():
         return
     files = sorted(SPOOL_DIR.glob("gapspool_*.jsonl"))
@@ -572,14 +585,13 @@ def replay_gap_spool(pool: ConnectionPool) -> None:
     for fp in files:
         try:
             count = 0
-            for line in fp.read_text().splitlines():
-                if not line.strip():
-                    continue
-                d = json.loads(line)
-                started = datetime.fromisoformat(d["started_at"])
-                ended   = datetime.fromisoformat(d["ended_at"])
-                with pool.connection() as con, con.cursor() as cur:
-                    # v5 FIX: ON CONFLICT (started_at, ended_at, reason)
+            with pool.connection() as con, con.cursor() as cur:
+                for line in fp.read_text().splitlines():
+                    if not line.strip():
+                        continue
+                    d = json.loads(line)
+                    started = datetime.fromisoformat(d["started_at"])
+                    ended   = datetime.fromisoformat(d["ended_at"])
                     cur.execute(
                         "INSERT INTO collector_gaps "
                         "(started_at, ended_at, reason) VALUES (%s, %s, %s) "
@@ -587,7 +599,7 @@ def replay_gap_spool(pool: ConnectionPool) -> None:
                         "DO NOTHING",
                         (started, ended, d.get("reason")),
                     )
-                count += 1
+                    count += 1
             log.info("replayed %d gaps from %s", count, fp.name)
             fp.unlink()
         except Exception as e:                                  # noqa: BLE001

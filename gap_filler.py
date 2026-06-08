@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import time
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -78,9 +79,10 @@ WHERE  id = %s
 def build_gap_query(today: bool, retry: bool) -> sql.SQL:
     conditions: list[sql.Composable] = [sql.SQL("filled = FALSE")]
     if today:
-        # v5 FIX (Qwen #2): IST day boundary, not server UTC
+        # v6 FIX (Gemini, Kimi #3): `ended_at` use करो — Friday→Monday वाला
+        # startup_gap भी आज के ended_at से match होगा।
         conditions.append(sql.SQL(
-            "started_at >= (now() AT TIME ZONE 'Asia/Kolkata')::date "
+            "ended_at >= (now() AT TIME ZONE 'Asia/Kolkata')::date "
             "AT TIME ZONE 'Asia/Kolkata'"
         ))
     if retry:
@@ -92,9 +94,11 @@ def build_gap_query(today: bool, retry: bool) -> sql.SQL:
 
 
 # ---------------------------------------------------------------------------
-# NSE holiday cache — v5 FIX: closed_exchanges + multi-format date parser
+# NSE holiday cache
+# v6 FIX (Qwen): cached years track करो — repeat API calls avoid
 # ---------------------------------------------------------------------------
-_HOLIDAYS: set[date] | None = None
+_HOLIDAYS:    set[date] | None = None
+_LOADED_YEARS: set[int]        = set()
 
 
 def _parse_holiday_date(s: Any) -> date | None:
@@ -113,21 +117,24 @@ def _parse_holiday_date(s: Any) -> date | None:
 
 
 def _load_holidays(client, years: set[int] | None = None) -> set[date]:
-    global _HOLIDAYS
-    if _HOLIDAYS is not None and years is None:
-        return _HOLIDAYS
+    global _HOLIDAYS, _LOADED_YEARS
+    if _HOLIDAYS is None:
+        _HOLIDAYS = set()
 
     target_years = years or {datetime.now(IST).year}
-    hols: set[date] = set(_HOLIDAYS) if _HOLIDAYS else set()
+    # v6 FIX (Qwen): सिर्फ़ missing years के लिए API call
+    years_to_fetch = target_years - _LOADED_YEARS
+    if not years_to_fetch:
+        return _HOLIDAYS
 
-    for y in target_years:
+    for y in years_to_fetch:
         try:
             resp = client.holidays(year=y)
         except Exception as e:                                   # noqa: BLE001
             log.warning("holidays(%d) API fail: %s", y, e)
+            _LOADED_YEARS.add(y)   # don't retry this run
             continue
 
-        # robust extraction (avoid list(resp.values()) — captures non-list values)
         items: list = []
         if isinstance(resp, dict):
             for k in ("data", "holidays", "result"):
@@ -142,22 +149,30 @@ def _load_holidays(client, years: set[int] | None = None) -> set[date]:
             if not isinstance(h, dict):
                 continue
 
-            # v5 FIX (ChatGPT #5): settlement holidays skip
-            closed = h.get("closed_exchanges") or h.get("closed") or []
-            htype  = (h.get("holiday_type") or h.get("type") or "").upper()
-            if closed and EXCHANGE not in closed:
-                continue
+            # v6 FIX (Kimi #9): empty list = "no exchanges closed" = NSE open
+            closed = h.get("closed_exchanges")
+            if closed is None:
+                closed = h.get("closed")
+            if isinstance(closed, list):
+                if not closed:
+                    continue                          # NSE open
+                if EXCHANGE not in closed:
+                    continue
+
+            htype = (h.get("holiday_type") or h.get("type") or "").upper()
             if htype and htype not in ("TRADING_HOLIDAY", "TRADING", ""):
                 continue
 
             d_str = h.get("date") or h.get("holiday_date") or h.get("day")
             d = _parse_holiday_date(d_str)
             if d:
-                hols.add(d)
+                _HOLIDAYS.add(d)
 
-    _HOLIDAYS = hols
-    log.info("loaded %d NSE holidays for years %s", len(hols), sorted(target_years))
-    return hols
+        _LOADED_YEARS.add(y)
+
+    log.info("loaded NSE holidays for years %s (cache=%d)",
+             sorted(years_to_fetch), len(_HOLIDAYS))
+    return _HOLIDAYS
 
 
 def is_trading_day(d: date, client=None) -> bool:
@@ -201,9 +216,16 @@ def gap_overlaps_market_hours(start: datetime, end: datetime, client=None) -> bo
     return False
 
 
-def fetch_history(client, symbol: str, sd: str, ed: str) -> Any | None:
+def fetch_history(client, symbol: str, sd: str, ed: str
+                  ) -> tuple[Any | None, bool]:
     """
-    v5 FIX (Gemini, Qwen): list/dict response को DataFrame में convert करते हैं।
+    v6 FIX (Kimi #4): tuple (df, had_api_error) return करो ताकि
+    "0 rows" को "API failure" से distinguish कर सकें।
+
+    Returns:
+      (df, False)   — successful, df has rows
+      (None, False) — successful, but no rows (illiquid / no-trade day)
+      (None, True)  — API exception thrown
     """
     try:
         df = client.history(
@@ -215,10 +237,10 @@ def fetch_history(client, symbol: str, sd: str, ed: str) -> Any | None:
         )
     except Exception as e:                                       # noqa: BLE001
         log.warning("history fail %s [%s..%s]: %s", symbol, sd, ed, e)
-        return None
+        return None, True                                        # API error
 
     if df is None:
-        return None
+        return None, False                                       # no error, no data
 
     # if not a DataFrame, try to convert
     if not hasattr(df, "iterrows"):
@@ -227,17 +249,31 @@ def fetch_history(client, symbol: str, sd: str, ed: str) -> Any | None:
                 df = (df.get("data") or df.get("candles") or
                       df.get("history") or [])
             df = pd.DataFrame(df)
-            for col in ("timestamp", "time", "ts", "date"):
+            # v6 FIX (Kimi #6): broker-specific column names cover करो
+            for col in ("timestamp", "time", "ts", "date",
+                        "datetime", "t", "dt"):
                 if col in df.columns:
                     df = df.set_index(col)
                     break
+            else:
+                # कोई recognized ts column नहीं — index check करो
+                if not (hasattr(df.index, "to_pydatetime")
+                        or (len(df.index) > 0
+                            and isinstance(df.index[0],
+                                           (datetime, pd.Timestamp)))):
+                    log.warning("history df %s: no ts column. cols=%s",
+                                symbol, list(df.columns)[:8])
+                    return None, False
         except Exception as e:                                   # noqa: BLE001
             log.warning("history df conversion fail %s: %s", symbol, e)
-            return None
+            return None, True
         if not hasattr(df, "iterrows"):
-            return None
+            return None, False
 
-    return df if len(df) > 0 else None
+    if len(df) == 0:
+        return None, False                                       # successfully empty
+
+    return df, False
 
 
 def df_rows_in_window(df, start: datetime, end: datetime,
@@ -264,11 +300,17 @@ def df_rows_in_window(df, start: datetime, end: datetime,
         if not (start_floor <= ts_utc <= end_floor):
             continue
         try:
+            # v6 FIX (Gemini): NaN volume safe cast
+            vol_raw = row["volume"] if "volume" in row else None
+            if vol_raw is None or pd.isna(vol_raw):
+                vol_clean: int | None = None
+            else:
+                vol_clean = int(float(vol_raw))
             rows.append((
                 ts_utc, EXCHANGE, symbol,
                 float(row["open"]), float(row["high"]),
                 float(row["low"]),  float(row["close"]),
-                int(row["volume"]) if "volume" in row else None,
+                vol_clean,
             ))
         except (KeyError, TypeError, ValueError) as e:
             log.warning("row parse fail %s @ %s: %s", symbol, ts_utc, e)
@@ -278,7 +320,10 @@ def df_rows_in_window(df, start: datetime, end: datetime,
 def fetch_history_chunked(client, symbol: str,
                           start: datetime, end: datetime
                           ) -> tuple[list[tuple], list[date]]:
-    """v5 FIX: failed_days भी return — multi-day partial failure track।"""
+    """
+    v6 FIX (Kimi #4): failed_days अब सिर्फ़ true API errors के लिए;
+    successful empty results (illiquid stock, no-trade day) failure नहीं।
+    """
     start_ist = start.astimezone(IST).date()
     end_ist   = end.astimezone(IST).date()
     all_rows: list[tuple] = []
@@ -287,9 +332,12 @@ def fetch_history_chunked(client, symbol: str,
         if not is_trading_day(day, client):
             continue
         sd = ed = day.isoformat()
-        df = fetch_history(client, symbol, sd, ed)
-        if df is None:
+        df, had_error = fetch_history(client, symbol, sd, ed)
+        if had_error:
             failed_days.append(day)
+            continue
+        if df is None:
+            # API succeeded but no rows — not a failure
             continue
         all_rows.extend(df_rows_in_window(df, start, end, symbol))
     return all_rows, failed_days
@@ -333,10 +381,30 @@ def fill_one_gap(client, pool, gid: int, start: datetime, end: datetime,
     return inserted, failed, last_err
 
 
+def make_pool_with_retry() -> ConnectionPool:
+    """v6 FIX (Kimi #5): symmetric with collector — DB startup retry।"""
+    pool = ConnectionPool(PG_DSN, min_size=1, max_size=2, open=False,
+                          kwargs={"autocommit": True})
+    last_err: Exception | None = None
+    for attempt in range(10):
+        try:
+            pool.open(wait=True, timeout=10)
+            log.info("DB pool ready (attempt %d)", attempt + 1)
+            return pool
+        except Exception as e:                                  # noqa: BLE001
+            last_err = e
+            delay = min(30, 2 ** attempt)
+            log.warning("DB pool open fail (attempt %d): %s — retry in %ds",
+                        attempt + 1, e, delay)
+            time.sleep(delay)
+    pool.close()
+    raise RuntimeError(f"DB unreachable after 10 retries: {last_err}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--today", action="store_true",
-                    help="सिर्फ़ आज (IST) के unfilled gaps")
+                    help="आज (IST) ended_at वाले unfilled gaps")
     ap.add_argument("--retry", action="store_true",
                     help="जिनमें पहले attempts हुए हैं वही")
     args = ap.parse_args()
@@ -344,8 +412,7 @@ def main() -> None:
     symbols = load_symbols(SYMBOLS_FILE)
     log.info("symbols: %d", len(symbols))
 
-    pool = ConnectionPool(PG_DSN, min_size=1, max_size=2, open=True,
-                          kwargs={"autocommit": True})
+    pool = make_pool_with_retry()
     try:
         query = build_gap_query(today=args.today, retry=args.retry)
         with pool.connection() as con, con.cursor() as cur:

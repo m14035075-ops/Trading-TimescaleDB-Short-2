@@ -1,46 +1,45 @@
-# NSE Tick Collector — Hindi गाइड (v5)
+# NSE Tick Collector — Hindi गाइड (v6)
 
 > 50 भारतीय शेयरों का **live tick data** OpenAlgo WebSocket से उठाकर अपने ही
 > server के **TimescaleDB** में store करने वाला production-grade project।
-> v5 में ChatGPT + Gemini + Qwen + Kimi के **4 rounds का review** लागू है —
-> कुल **57+ bugs fix**।
+> v6 में ChatGPT + Gemini + Qwen + Kimi के **5 rounds का review** लागू है —
+> कुल **67+ bugs fix**।
 
 ---
 
-## v1 → v2 → v3 → v4 → v5 का सफर
+## v1 → v6 का सफर
 
-- **v2 (round-1: 12 fixes):** watchdog placement, parse_tick nested data,
-  tick_volume delta, disk spool, gap_filler retry, IST timezone
-- **v3 (round-2: 15 fixes):** watchdog grace, naive timestamp, day-rollover,
-  depth arrays, MODE=both reject, partial-minute floor, etc.
-- **v4 (round-3: 10 fixes):** ALTER migration, late-start guard, tick_uid,
-  numeric string ts, gap_spool, holiday API
-- **v5 (round-4: 20 fixes):** **see below**
+- **v2 (round-1: 12 fixes):** watchdog, parse_tick, tick_volume, spool, IST
+- **v3 (round-2: 15 fixes):** day-rollover, depth arrays, MODE=both reject
+- **v4 (round-3: 10 fixes):** ALTER migration, late-start guard, tick_uid
+- **v5 (round-4: 20 fixes):** SHA-256, auto-startup-gap, holiday API, quality
+- **v6 (round-5: 10 fixes):** see below
 
-### v5 round-4 fixes (20 critical issues)
+### v6 round-5 fixes
 
 | # | Bug                                                                    | Fix |
 |---|------------------------------------------------------------------------|-----|
-| 1 | `tick_uid` hash incomplete — depth/raw missing, unstable float, 0/None collapse | 32-char SHA-256 + content hash for depth/raw + `_norm()` (None vs 0) + `f"{x:.6f}"` |
-| 2 | **Monday-restart volume loss** — day rollover after 9:30 lost data    | Auto-startup-gap recording: last DB tick से अब तक का gap on first connect |
-| 3 | `collector_gaps` no UNIQUE → spool replay duplicates                   | UNIQUE(started_at, ended_at, COALESCE(reason,'')) + ON CONFLICT DO NOTHING |
-| 4 | `gap_minutes` SQL last-partial-minute miss                             | `time_bucket` floor on BOTH ends of generate_series |
-| 5 | `v_quotes_1m_raw` history filter missing (always included)             | `WHERE lm.ts IS NULL OR gm.ts IS NOT NULL` |
-| 6 | Quality priority wrong (`full > history > sparse > partial`)            | New: `full > sparse > history > partial` (live real > history fill) |
-| 7 | `--today` IST timezone bug (UTC truncation)                            | `(now() AT TIME ZONE 'Asia/Kolkata')::date AT TIME ZONE 'Asia/Kolkata'` |
-| 8 | `df_rows_in_window` crashes on list/dict response                      | Defensive: convert to DataFrame; handle `to_pydatetime`/string/datetime |
-| 9 | NSE holidays parsing fragile (settlement holidays counted, date format breaks) | `closed_exchanges`/`holiday_type` filter + multi-format parser + dynamic year range |
-| 10 | Multi-day partial gap success                                          | `failed_days` tracking; failure ONLY on API errors |
-| 11 | SQL injection pattern in gap_filler                                    | `psycopg.sql` composition |
-| 12 | `_parse_timestamp` matches non-timestamps ("1.5" → 1970)               | Strict regex + range check (2000-2100) |
-| 13 | Pool startup fragility (DB down at startup = crash)                    | Retry loop with exponential backoff (10 attempts) |
-| 14 | Flusher buffer loss on hang                                            | Lock-protected `buf` + `take_buffer_snapshot()` on shutdown |
-| 15 | `requirements.txt` missing pandas, version mismatch                    | `pandas>=2.0.0`, `psycopg-pool>=3.2` |
-| 16 | `.env.example` v3 header                                               | v5 |
-| 17 | Watchdog 30s false positives in low liquidity                          | Default 60s |
-| 18 | `fill_one_gap` over-strict (15:25-15:35 false-fail)                    | Failure only on API errors, not 0-rows |
-| 19 | Holiday cache static years                                             | Dynamic from gap dates |
-| 20 | Tick_uid 16-char (~10 days at scale possibly)                          | 32 chars (128-bit safe for billions) |
+| 1 | **`--today` Friday→Monday gap miss** — startup_gap के `started_at` Friday था, today filter skip कर देता था | `ended_at >= today_start_ist` (Monday morning का startup_gap match होगा) |
+| 2 | **`fetch_history` 0-rows = API error** — illiquid stocks falsely marked failed | `(df, had_error)` tuple — empty result success, exception failure |
+| 3 | **`gap_filler` no pool retry** — DB temporary down पर cron crash | `make_pool_with_retry()` (10-attempt exponential, symmetric with collector) |
+| 4 | **`pandas` NaN volume → int(NaN) ValueError** — valid row drop | `pd.isna()` check + safe casting |
+| 5 | **DataFrame ts column missing** ("datetime"/"t"/"dt") → silent ALL ROWS skip | Extended column names + warning log if no ts found |
+| 6 | **`_hash_jsonb` NaN/Inf → ValueError** | `allow_nan=True` |
+| 7 | **`replay_gap_spool` N+1 connections** | Single transaction per file |
+| 8 | **Per-symbol startup gap** — global max(ts) misses symbols with older data | `min(max(ts) per symbol)` (conservative coverage) |
+| 9 | **Holiday cache redundant API calls** — cached years still re-fetched | `_LOADED_YEARS` set tracks which years done |
+| 10 | **Empty `closed_exchanges` list semantics** | Empty list = NSE open (not a holiday) |
+
+### v5 round-4 fixes (20 critical issues, summary)
+
+tick_uid 32-char SHA-256 + depth/raw hash, auto-startup-gap recording,
+collector_gaps UNIQUE constraint, gap_minutes time_bucket floor,
+v_quotes_1m_raw history filter, quality priority full>sparse>history>partial,
+--today IST fix, df_rows_in_window defensive, NSE holidays robust parsing,
+multi-day failed_days tracking, psycopg.sql composition, _parse_timestamp
+range check, pool startup retry, flusher buf lock, requirements pandas+pool,
+.env v5 header, watchdog 60s default, fill_one_gap lenient (no false-fail
+on 0-rows), dynamic holiday year cache, tick_uid 32-char (128-bit safe).
 
 ---
 
@@ -248,6 +247,6 @@ Trading-TimescaleDB-Short-2/
 └── REVIEW_BUNDLE.md    Single-file bundle for AI review
 ```
 
-> **Status:** v5 — **57+ review issues fixed across 4 rounds**। Production-deploy ready।
+> **Status:** v6 — **67+ review issues fixed across 5 rounds**। Production-deploy ready।
 
 बस — market hours में `collector.py` चलाते रहें; production-grade tick data रोज़ का इकट्ठा होता रहेगा।

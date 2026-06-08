@@ -1,31 +1,26 @@
-# NSE Tick Collector — Full Code Review Bundle (v5)
+# NSE Tick Collector — Full Code Review Bundle (v6)
 
 > **For ChatGPT / Gemini / Claude / Qwen / Kimi reviewers:**
-> यह **v5** है — round-1 (12) + round-2 (15) + round-3 (10) + round-4 (20) = **57 review issues fixed**।
+> यह **v6** है — round-1 (12) + round-2 (15) + round-3 (10) + round-4 (20) + round-5 (10) = **67 review issues fixed**।
 >
-> **v5 round-4 के prominent changes:**
-> - tick_uid: 32-char SHA-256 + depth/raw content hash + stable float + None vs 0 distinction
-> - Auto-startup-gap recording (last DB tick से अब तक का gap on first connect)
-> - collector_gaps UNIQUE constraint + ON CONFLICT DO NOTHING
-> - gap_minutes SQL: time_bucket floor on BOTH ends
-> - v_quotes_1m_raw: history filter (live missing/partial only)
-> - Quality priority: full > sparse > history > partial
-> - Pool startup retry (10 attempts, exponential)
-> - Flusher local buf lock-protected (hang-safe shutdown)
-> - --today IST timezone fix
-> - df_rows_in_window list/dict defensive
-> - NSE holidays: closed_exchanges + multi-format dates + dynamic years
-> - fill_one_gap: failure only on API errors (failed_days)
-> - psycopg.sql composition (no string formatting injection)
-> - _parse_timestamp range check (2000-2100)
-> - Watchdog default 60s
+> **v6 round-5 के prominent changes:**
+> - `--today`: filter `ended_at >= today_start_ist` (Friday→Monday gap अब cover होगा)
+> - `fetch_history` returns `(df, had_error)` — 0 rows ≠ API error
+> - `gap_filler` pool retry (10-attempt) symmetric with collector
+> - NaN volume safe cast via `pd.isna()`
+> - DataFrame ts column robust (datetime/t/dt + warning log)
+> - `_hash_jsonb` `allow_nan=True`
+> - `replay_gap_spool` single-transaction per file
+> - Per-symbol startup gap: `min(max(ts) per symbol)`
+> - Holiday cache `_LOADED_YEARS` tracking
+> - Empty `closed_exchanges` semantics fixed
 >
 > **अब verify करना है:**
-> 1. tick_uid hash का depth_obj content stable है? (Jsonb wrapping के साथ)
-> 2. Auto-startup-gap recording — gap_filler जब पहली बार चले, क्या morning का सब history भर पाएगा?
-> 3. Multi-day failed_days tracking सही है?
-> 4. Quality priority full > sparse > history > partial — edge cases?
-> 5. NSE holidays API के 30+ broker variations सब cover हुए?
+> 1. `--today` overlap edge cases — what if gap started AND ended yesterday?
+> 2. `fetch_history` empty-result semantics — broker variations?
+> 3. Per-symbol min(max_ts) gap query performance on huge tables?
+> 4. NaN volume cast — DataFrame edge cases (None vs NaN vs 'N/A' string)?
+> 5. Pool retry exponential — DB-down for 30 min scenarios?
 
 ---
 
@@ -34,8 +29,8 @@
 ```
 Trading-TimescaleDB-Short-2/
 ├── schema.sql          UNIQUE indexes + smart views with quality
-├── collector.py        Auto-startup-gap + pool retry + flusher protection
-├── gap_filler.py       psycopg.sql + holiday awareness + failed_days
+├── collector.py        Per-symbol startup-gap, allow_nan hash, single-tx replay
+├── gap_filler.py       --today overlap, (df, error) tuple, pool retry, NaN-safe
 ├── symbols.txt
 ├── requirements.txt    + pandas
 ├── .env.example
@@ -262,7 +257,7 @@ ORDER  BY ts, exchange, symbol,
 
 ---
 
-## File 2 of 8 — `collector.py`  (844 lines)
+## File 2 of 8 — `collector.py`  (856 lines)
 
 ```python
 """
@@ -449,12 +444,22 @@ def seed_last_cum_vol(pool: ConnectionPool) -> None:
 
 
 def get_last_db_tick_ts(pool: ConnectionPool) -> datetime | None:
-    """v5 FIX: startup पर last DB tick का time लाओ → auto gap recording।"""
+    """
+    v6 FIX (ChatGPT #5): per-symbol min(max(ts)) — सबसे stale symbol का
+    last-seen time वाला conservative gap रिकॉर्ड करते हैं ताकि कोई
+    symbol coverage छूटे न।
+    """
     try:
         with pool.connection() as con, con.cursor() as cur:
-            cur.execute(
-                "SELECT max(ts) FROM ticks WHERE ts >= now() - INTERVAL '7 days'"
-            )
+            cur.execute("""
+                WITH per_symbol AS (
+                    SELECT symbol, max(ts) AS max_ts
+                    FROM   ticks
+                    WHERE  ts >= now() - INTERVAL '7 days'
+                    GROUP  BY symbol
+                )
+                SELECT min(max_ts) FROM per_symbol
+            """)
             row = cur.fetchone()
         return row[0] if row and row[0] else None
     except Exception as e:                                      # noqa: BLE001
@@ -627,12 +632,14 @@ def _norm_float(v: Any) -> str:
 
 
 def _hash_jsonb(j: Any) -> str:
+    """v6 FIX (Qwen): allow_nan=True — broker के NaN/Inf floats crash न करें।"""
     if j is None:
         return ""
     obj = j.obj if isinstance(j, Jsonb) else j
     try:
         return hashlib.sha256(
-            json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
+            json.dumps(obj, sort_keys=True, default=str,
+                       allow_nan=True).encode("utf-8")
         ).hexdigest()[:16]
     except (TypeError, ValueError):
         return "<unhashable>"
@@ -830,6 +837,7 @@ def replay_spool(pool: ConnectionPool) -> None:
 
 
 def replay_gap_spool(pool: ConnectionPool) -> None:
+    """v6 FIX (Qwen): single-transaction per file (no N+1 connections)."""
     if not SPOOL_DIR.exists():
         return
     files = sorted(SPOOL_DIR.glob("gapspool_*.jsonl"))
@@ -839,14 +847,13 @@ def replay_gap_spool(pool: ConnectionPool) -> None:
     for fp in files:
         try:
             count = 0
-            for line in fp.read_text().splitlines():
-                if not line.strip():
-                    continue
-                d = json.loads(line)
-                started = datetime.fromisoformat(d["started_at"])
-                ended   = datetime.fromisoformat(d["ended_at"])
-                with pool.connection() as con, con.cursor() as cur:
-                    # v5 FIX: ON CONFLICT (started_at, ended_at, reason)
+            with pool.connection() as con, con.cursor() as cur:
+                for line in fp.read_text().splitlines():
+                    if not line.strip():
+                        continue
+                    d = json.loads(line)
+                    started = datetime.fromisoformat(d["started_at"])
+                    ended   = datetime.fromisoformat(d["ended_at"])
                     cur.execute(
                         "INSERT INTO collector_gaps "
                         "(started_at, ended_at, reason) VALUES (%s, %s, %s) "
@@ -854,7 +861,7 @@ def replay_gap_spool(pool: ConnectionPool) -> None:
                         "DO NOTHING",
                         (started, ended, d.get("reason")),
                     )
-                count += 1
+                    count += 1
             log.info("replayed %d gaps from %s", count, fp.name)
             fp.unlink()
         except Exception as e:                                  # noqa: BLE001
@@ -1113,7 +1120,7 @@ if __name__ == "__main__":
 
 ---
 
-## File 3 of 8 — `gap_filler.py`  (396 lines)
+## File 3 of 8 — `gap_filler.py`  (463 lines)
 
 ```python
 """
@@ -1133,6 +1140,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import time
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -1196,9 +1204,10 @@ WHERE  id = %s
 def build_gap_query(today: bool, retry: bool) -> sql.SQL:
     conditions: list[sql.Composable] = [sql.SQL("filled = FALSE")]
     if today:
-        # v5 FIX (Qwen #2): IST day boundary, not server UTC
+        # v6 FIX (Gemini, Kimi #3): `ended_at` use करो — Friday→Monday वाला
+        # startup_gap भी आज के ended_at से match होगा।
         conditions.append(sql.SQL(
-            "started_at >= (now() AT TIME ZONE 'Asia/Kolkata')::date "
+            "ended_at >= (now() AT TIME ZONE 'Asia/Kolkata')::date "
             "AT TIME ZONE 'Asia/Kolkata'"
         ))
     if retry:
@@ -1210,9 +1219,11 @@ def build_gap_query(today: bool, retry: bool) -> sql.SQL:
 
 
 # ---------------------------------------------------------------------------
-# NSE holiday cache — v5 FIX: closed_exchanges + multi-format date parser
+# NSE holiday cache
+# v6 FIX (Qwen): cached years track करो — repeat API calls avoid
 # ---------------------------------------------------------------------------
-_HOLIDAYS: set[date] | None = None
+_HOLIDAYS:    set[date] | None = None
+_LOADED_YEARS: set[int]        = set()
 
 
 def _parse_holiday_date(s: Any) -> date | None:
@@ -1231,21 +1242,24 @@ def _parse_holiday_date(s: Any) -> date | None:
 
 
 def _load_holidays(client, years: set[int] | None = None) -> set[date]:
-    global _HOLIDAYS
-    if _HOLIDAYS is not None and years is None:
-        return _HOLIDAYS
+    global _HOLIDAYS, _LOADED_YEARS
+    if _HOLIDAYS is None:
+        _HOLIDAYS = set()
 
     target_years = years or {datetime.now(IST).year}
-    hols: set[date] = set(_HOLIDAYS) if _HOLIDAYS else set()
+    # v6 FIX (Qwen): सिर्फ़ missing years के लिए API call
+    years_to_fetch = target_years - _LOADED_YEARS
+    if not years_to_fetch:
+        return _HOLIDAYS
 
-    for y in target_years:
+    for y in years_to_fetch:
         try:
             resp = client.holidays(year=y)
         except Exception as e:                                   # noqa: BLE001
             log.warning("holidays(%d) API fail: %s", y, e)
+            _LOADED_YEARS.add(y)   # don't retry this run
             continue
 
-        # robust extraction (avoid list(resp.values()) — captures non-list values)
         items: list = []
         if isinstance(resp, dict):
             for k in ("data", "holidays", "result"):
@@ -1260,22 +1274,30 @@ def _load_holidays(client, years: set[int] | None = None) -> set[date]:
             if not isinstance(h, dict):
                 continue
 
-            # v5 FIX (ChatGPT #5): settlement holidays skip
-            closed = h.get("closed_exchanges") or h.get("closed") or []
-            htype  = (h.get("holiday_type") or h.get("type") or "").upper()
-            if closed and EXCHANGE not in closed:
-                continue
+            # v6 FIX (Kimi #9): empty list = "no exchanges closed" = NSE open
+            closed = h.get("closed_exchanges")
+            if closed is None:
+                closed = h.get("closed")
+            if isinstance(closed, list):
+                if not closed:
+                    continue                          # NSE open
+                if EXCHANGE not in closed:
+                    continue
+
+            htype = (h.get("holiday_type") or h.get("type") or "").upper()
             if htype and htype not in ("TRADING_HOLIDAY", "TRADING", ""):
                 continue
 
             d_str = h.get("date") or h.get("holiday_date") or h.get("day")
             d = _parse_holiday_date(d_str)
             if d:
-                hols.add(d)
+                _HOLIDAYS.add(d)
 
-    _HOLIDAYS = hols
-    log.info("loaded %d NSE holidays for years %s", len(hols), sorted(target_years))
-    return hols
+        _LOADED_YEARS.add(y)
+
+    log.info("loaded NSE holidays for years %s (cache=%d)",
+             sorted(years_to_fetch), len(_HOLIDAYS))
+    return _HOLIDAYS
 
 
 def is_trading_day(d: date, client=None) -> bool:
@@ -1319,9 +1341,16 @@ def gap_overlaps_market_hours(start: datetime, end: datetime, client=None) -> bo
     return False
 
 
-def fetch_history(client, symbol: str, sd: str, ed: str) -> Any | None:
+def fetch_history(client, symbol: str, sd: str, ed: str
+                  ) -> tuple[Any | None, bool]:
     """
-    v5 FIX (Gemini, Qwen): list/dict response को DataFrame में convert करते हैं।
+    v6 FIX (Kimi #4): tuple (df, had_api_error) return करो ताकि
+    "0 rows" को "API failure" से distinguish कर सकें।
+
+    Returns:
+      (df, False)   — successful, df has rows
+      (None, False) — successful, but no rows (illiquid / no-trade day)
+      (None, True)  — API exception thrown
     """
     try:
         df = client.history(
@@ -1333,10 +1362,10 @@ def fetch_history(client, symbol: str, sd: str, ed: str) -> Any | None:
         )
     except Exception as e:                                       # noqa: BLE001
         log.warning("history fail %s [%s..%s]: %s", symbol, sd, ed, e)
-        return None
+        return None, True                                        # API error
 
     if df is None:
-        return None
+        return None, False                                       # no error, no data
 
     # if not a DataFrame, try to convert
     if not hasattr(df, "iterrows"):
@@ -1345,17 +1374,31 @@ def fetch_history(client, symbol: str, sd: str, ed: str) -> Any | None:
                 df = (df.get("data") or df.get("candles") or
                       df.get("history") or [])
             df = pd.DataFrame(df)
-            for col in ("timestamp", "time", "ts", "date"):
+            # v6 FIX (Kimi #6): broker-specific column names cover करो
+            for col in ("timestamp", "time", "ts", "date",
+                        "datetime", "t", "dt"):
                 if col in df.columns:
                     df = df.set_index(col)
                     break
+            else:
+                # कोई recognized ts column नहीं — index check करो
+                if not (hasattr(df.index, "to_pydatetime")
+                        or (len(df.index) > 0
+                            and isinstance(df.index[0],
+                                           (datetime, pd.Timestamp)))):
+                    log.warning("history df %s: no ts column. cols=%s",
+                                symbol, list(df.columns)[:8])
+                    return None, False
         except Exception as e:                                   # noqa: BLE001
             log.warning("history df conversion fail %s: %s", symbol, e)
-            return None
+            return None, True
         if not hasattr(df, "iterrows"):
-            return None
+            return None, False
 
-    return df if len(df) > 0 else None
+    if len(df) == 0:
+        return None, False                                       # successfully empty
+
+    return df, False
 
 
 def df_rows_in_window(df, start: datetime, end: datetime,
@@ -1382,11 +1425,17 @@ def df_rows_in_window(df, start: datetime, end: datetime,
         if not (start_floor <= ts_utc <= end_floor):
             continue
         try:
+            # v6 FIX (Gemini): NaN volume safe cast
+            vol_raw = row["volume"] if "volume" in row else None
+            if vol_raw is None or pd.isna(vol_raw):
+                vol_clean: int | None = None
+            else:
+                vol_clean = int(float(vol_raw))
             rows.append((
                 ts_utc, EXCHANGE, symbol,
                 float(row["open"]), float(row["high"]),
                 float(row["low"]),  float(row["close"]),
-                int(row["volume"]) if "volume" in row else None,
+                vol_clean,
             ))
         except (KeyError, TypeError, ValueError) as e:
             log.warning("row parse fail %s @ %s: %s", symbol, ts_utc, e)
@@ -1396,7 +1445,10 @@ def df_rows_in_window(df, start: datetime, end: datetime,
 def fetch_history_chunked(client, symbol: str,
                           start: datetime, end: datetime
                           ) -> tuple[list[tuple], list[date]]:
-    """v5 FIX: failed_days भी return — multi-day partial failure track।"""
+    """
+    v6 FIX (Kimi #4): failed_days अब सिर्फ़ true API errors के लिए;
+    successful empty results (illiquid stock, no-trade day) failure नहीं।
+    """
     start_ist = start.astimezone(IST).date()
     end_ist   = end.astimezone(IST).date()
     all_rows: list[tuple] = []
@@ -1405,9 +1457,12 @@ def fetch_history_chunked(client, symbol: str,
         if not is_trading_day(day, client):
             continue
         sd = ed = day.isoformat()
-        df = fetch_history(client, symbol, sd, ed)
-        if df is None:
+        df, had_error = fetch_history(client, symbol, sd, ed)
+        if had_error:
             failed_days.append(day)
+            continue
+        if df is None:
+            # API succeeded but no rows — not a failure
             continue
         all_rows.extend(df_rows_in_window(df, start, end, symbol))
     return all_rows, failed_days
@@ -1451,10 +1506,30 @@ def fill_one_gap(client, pool, gid: int, start: datetime, end: datetime,
     return inserted, failed, last_err
 
 
+def make_pool_with_retry() -> ConnectionPool:
+    """v6 FIX (Kimi #5): symmetric with collector — DB startup retry।"""
+    pool = ConnectionPool(PG_DSN, min_size=1, max_size=2, open=False,
+                          kwargs={"autocommit": True})
+    last_err: Exception | None = None
+    for attempt in range(10):
+        try:
+            pool.open(wait=True, timeout=10)
+            log.info("DB pool ready (attempt %d)", attempt + 1)
+            return pool
+        except Exception as e:                                  # noqa: BLE001
+            last_err = e
+            delay = min(30, 2 ** attempt)
+            log.warning("DB pool open fail (attempt %d): %s — retry in %ds",
+                        attempt + 1, e, delay)
+            time.sleep(delay)
+    pool.close()
+    raise RuntimeError(f"DB unreachable after 10 retries: {last_err}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--today", action="store_true",
-                    help="सिर्फ़ आज (IST) के unfilled gaps")
+                    help="आज (IST) ended_at वाले unfilled gaps")
     ap.add_argument("--retry", action="store_true",
                     help="जिनमें पहले attempts हुए हैं वही")
     args = ap.parse_args()
@@ -1462,8 +1537,7 @@ def main() -> None:
     symbols = load_symbols(SYMBOLS_FILE)
     log.info("symbols: %d", len(symbols))
 
-    pool = ConnectionPool(PG_DSN, min_size=1, max_size=2, open=True,
-                          kwargs={"autocommit": True})
+    pool = make_pool_with_retry()
     try:
         query = build_gap_query(today=args.today, retry=args.retry)
         with pool.connection() as con, con.cursor() as cur:
@@ -1649,24 +1723,37 @@ __pycache__/
 ## File 8 of 8 — `README.md`
 
 ````markdown
-# NSE Tick Collector — Hindi गाइड (v5)
+# NSE Tick Collector — Hindi गाइड (v6)
 
 > 50 भारतीय शेयरों का **live tick data** OpenAlgo WebSocket से उठाकर अपने ही
 > server के **TimescaleDB** में store करने वाला production-grade project।
-> v5 में ChatGPT + Gemini + Qwen + Kimi के **4 rounds का review** लागू है —
-> कुल **57+ bugs fix**।
+> v6 में ChatGPT + Gemini + Qwen + Kimi के **5 rounds का review** लागू है —
+> कुल **67+ bugs fix**।
 
 ---
 
-## v1 → v2 → v3 → v4 → v5 का सफर
+## v1 → v6 का सफर
 
-- **v2 (round-1: 12 fixes):** watchdog placement, parse_tick nested data,
-  tick_volume delta, disk spool, gap_filler retry, IST timezone
-- **v3 (round-2: 15 fixes):** watchdog grace, naive timestamp, day-rollover,
-  depth arrays, MODE=both reject, partial-minute floor, etc.
-- **v4 (round-3: 10 fixes):** ALTER migration, late-start guard, tick_uid,
-  numeric string ts, gap_spool, holiday API
-- **v5 (round-4: 20 fixes):** **see below**
+- **v2 (round-1: 12 fixes):** watchdog, parse_tick, tick_volume, spool, IST
+- **v3 (round-2: 15 fixes):** day-rollover, depth arrays, MODE=both reject
+- **v4 (round-3: 10 fixes):** ALTER migration, late-start guard, tick_uid
+- **v5 (round-4: 20 fixes):** SHA-256, auto-startup-gap, holiday API, quality
+- **v6 (round-5: 10 fixes):** see below
+
+### v6 round-5 fixes
+
+| # | Bug                                                                    | Fix |
+|---|------------------------------------------------------------------------|-----|
+| 1 | **`--today` Friday→Monday gap miss** — startup_gap के `started_at` Friday था, today filter skip कर देता था | `ended_at >= today_start_ist` (Monday morning का startup_gap match होगा) |
+| 2 | **`fetch_history` 0-rows = API error** — illiquid stocks falsely marked failed | `(df, had_error)` tuple — empty result success, exception failure |
+| 3 | **`gap_filler` no pool retry** — DB temporary down पर cron crash | `make_pool_with_retry()` (10-attempt exponential, symmetric with collector) |
+| 4 | **`pandas` NaN volume → int(NaN) ValueError** — valid row drop | `pd.isna()` check + safe casting |
+| 5 | **DataFrame ts column missing** ("datetime"/"t"/"dt") → silent ALL ROWS skip | Extended column names + warning log if no ts found |
+| 6 | **`_hash_jsonb` NaN/Inf → ValueError** | `allow_nan=True` |
+| 7 | **`replay_gap_spool` N+1 connections** | Single transaction per file |
+| 8 | **Per-symbol startup gap** — global max(ts) misses symbols with older data | `min(max(ts) per symbol)` (conservative coverage) |
+| 9 | **Holiday cache redundant API calls** — cached years still re-fetched | `_LOADED_YEARS` set tracks which years done |
+| 10 | **Empty `closed_exchanges` list semantics** | Empty list = NSE open (not a holiday) |
 
 ### v5 round-4 fixes (20 critical issues)
 
@@ -1899,11 +1986,11 @@ Trading-TimescaleDB-Short-2/
 └── REVIEW_BUNDLE.md    Single-file bundle for AI review
 ```
 
-> **Status:** v5 — **57+ review issues fixed across 4 rounds**। Production-deploy ready।
+> **Status:** v6 — **67+ review issues fixed across 5 rounds**। Production-deploy ready।
 
 बस — market hours में `collector.py` चलाते रहें; production-grade tick data रोज़ का इकट्ठा होता रहेगा।
 ````
 
 ---
 
-## End of bundle — Total: 8 files, 1805 lines.
+## End of bundle — Total: 8 files, 1897 lines.
