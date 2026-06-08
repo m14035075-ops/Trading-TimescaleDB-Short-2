@@ -1,51 +1,49 @@
 -- =====================================================================
--- NSE Tick Collector — TimescaleDB Schema  (v5 — round-4 review fixes)
+-- NSE Tick Collector — TimescaleDB Schema
 -- =====================================================================
--- नए install पर:
---     psql -U postgres -d marketdata -f schema.sql
---
--- पुराने (v2/v3/v4) DB से upgrade — सिर्फ़ views drop करें
--- (CAGG `ohlc_1s` को drop मत करें — सब historical data चला जाएगा):
---     DROP VIEW IF EXISTS v_quotes_1m, v_quotes_1m_raw;
--- फिर schema.sql चलाएँ। ALTER TABLE से नए columns idempotent जुड़ेंगे।
+-- एक बार चलाएं:  psql -U postgres -d marketdata -f schema.sql
+-- TimescaleDB extension पहले से installed होनी चाहिए।
 -- =====================================================================
 
+-- TimescaleDB extension activate करें (अगर पहले से नहीं है)
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 -- ---------------------------------------------------------------------
--- 1) ticks
+-- 1) ticks — हर WebSocket tick (raw data)
+--    stream_type: 'quote' (Level-1) या 'depth' (Level-2)
+--    tick_volume: इस tick में कितनी quantity ट्रेड हुई (cumulative volume का delta)
+--    depth: पूरा order book snapshot (JSONB, सिर्फ depth mode में)
+--    tick_uid: SHA-256 hash — duplicate-rokne के लिए unique key
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS ticks (
-    ts          TIMESTAMPTZ      NOT NULL,
-    exchange    TEXT             NOT NULL,
-    symbol      TEXT             NOT NULL,
-    stream_type TEXT             NOT NULL DEFAULT 'quote',
-    ltp         DOUBLE PRECISION NOT NULL,
-    volume      BIGINT,
-    tick_volume BIGINT,
-    bid         DOUBLE PRECISION,
-    ask         DOUBLE PRECISION,
-    open        DOUBLE PRECISION,
-    high        DOUBLE PRECISION,
-    low         DOUBLE PRECISION,
-    close       DOUBLE PRECISION,
-    depth       JSONB,
-    raw         JSONB,
-    tick_uid    TEXT
+    ts          TIMESTAMPTZ      NOT NULL,                   -- timestamp (UTC में)
+    exchange    TEXT             NOT NULL,                   -- NSE / BSE
+    symbol      TEXT             NOT NULL,                   -- शेयर का नाम (RELIANCE, TCS...)
+    stream_type TEXT             NOT NULL DEFAULT 'quote',   -- कौन से subscription से आया
+    ltp         DOUBLE PRECISION NOT NULL,                   -- last traded price
+    volume      BIGINT,                                      -- cumulative day volume
+    tick_volume BIGINT,                                      -- इस tick की actual quantity (delta)
+    bid         DOUBLE PRECISION,                            -- best bid price
+    ask         DOUBLE PRECISION,                            -- best ask price
+    open        DOUBLE PRECISION,                            -- day's open
+    high        DOUBLE PRECISION,                            -- day's high
+    low         DOUBLE PRECISION,                            -- day's low
+    close       DOUBLE PRECISION,                            -- previous close
+    depth       JSONB,                                       -- Level-2 order book
+    raw         JSONB,                                       -- backup payload (debug)
+    tick_uid    TEXT                                         -- dedup hash
 );
 
--- Idempotent migration columns
+-- अगर पुराने schema से upgrade कर रहे हैं तो ये columns add हो जाएँगे
 ALTER TABLE ticks ADD COLUMN IF NOT EXISTS stream_type TEXT;
 ALTER TABLE ticks ALTER COLUMN stream_type SET DEFAULT 'quote';
 
--- v7 FIX (Gemini): UPDATE in DO block — production table पर हर schema-run पर
--- redundant full-scan UPDATE से बचाव। सिर्फ़ तभी चलेगा जब NULL rows मिलें।
--- ⚠️ बहुत बड़े पुराने table पर एक बार table-lock हो सकता है — माइग्रेशन
--- के समय off-hours में चलाएँ।
+-- पुराने NULL rows को 'quote' से backfill करो (सिर्फ़ तब जब NULL मौजूद हों)
+-- ⚠️ बहुत बड़े production table पर migration off-hours में चलाएँ
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM ticks WHERE stream_type IS NULL LIMIT 1) THEN
-        RAISE NOTICE 'Backfilling NULL stream_type — पुराने (v3-/v4-) data पर एक बार';
+        RAISE NOTICE 'पुराने NULL stream_type rows backfill कर रहे हैं';
         UPDATE ticks SET stream_type = 'quote' WHERE stream_type IS NULL;
     END IF;
 END $$;
@@ -55,38 +53,44 @@ ALTER TABLE ticks ADD COLUMN IF NOT EXISTS tick_volume BIGINT;
 ALTER TABLE ticks ADD COLUMN IF NOT EXISTS depth       JSONB;
 ALTER TABLE ticks ADD COLUMN IF NOT EXISTS tick_uid    TEXT;
 
+-- Hypertable बनाओ — हर 1 दिन का अलग chunk
 SELECT create_hypertable(
     'ticks', 'ts',
     chunk_time_interval => INTERVAL '1 day',
     if_not_exists => TRUE
 );
 
+-- Lookup speed के लिए index (exchange first → multi-exchange queries fast)
 CREATE INDEX IF NOT EXISTS idx_ticks_ex_sym_ts
     ON ticks (exchange, symbol, ts DESC);
 
--- v5: 32-char SHA-256 tick_uid → spool replay safe
+-- Spool replay duplicate से बचाव के लिए unique index
+-- (TimescaleDB में partition column 'ts' include करना ज़रूरी है)
 CREATE UNIQUE INDEX IF NOT EXISTS uq_ticks_dedupe
     ON ticks (ts, tick_uid);
 
 -- ---------------------------------------------------------------------
 -- 2) ohlc_1s — 1-second OHLCV continuous aggregate
+--    materialized_only = false → real-time aggregation enable
+--    Volume = sum(tick_volume) — सही formula (per-tick delta का sum)
 -- ---------------------------------------------------------------------
 CREATE MATERIALIZED VIEW IF NOT EXISTS ohlc_1s
 WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
 SELECT
-    time_bucket('1 second', ts)              AS bucket,
+    time_bucket('1 second', ts)              AS bucket,       -- 1-sec time bucket
     exchange,
     symbol,
-    first(ltp, ts)                           AS open,
-    max(ltp)                                 AS high,
-    min(ltp)                                 AS low,
-    last(ltp, ts)                            AS close,
-    COALESCE(SUM(tick_volume), 0)::BIGINT    AS volume,
-    COUNT(*)                                 AS tick_count
+    first(ltp, ts)                           AS open,         -- bucket का पहला ltp
+    max(ltp)                                 AS high,         -- highest ltp
+    min(ltp)                                 AS low,          -- lowest ltp
+    last(ltp, ts)                            AS close,        -- bucket का आख़िरी ltp
+    COALESCE(SUM(tick_volume), 0)::BIGINT    AS volume,       -- कुल tick_volumes का sum
+    COUNT(*)                                 AS tick_count    -- कितने ticks आए
 FROM ticks
 GROUP BY bucket, exchange, symbol
 WITH NO DATA;
 
+-- हर 30 सेकंड में background में refresh
 SELECT add_continuous_aggregate_policy('ohlc_1s',
     start_offset => INTERVAL '10 minutes',
     end_offset   => INTERVAL '10 seconds',
@@ -94,43 +98,52 @@ SELECT add_continuous_aggregate_policy('ohlc_1s',
     if_not_exists => TRUE);
 
 -- ---------------------------------------------------------------------
--- 3) Compression
+-- 3) Compression — 7 दिन से पुराना data compress (~10x storage saving)
 -- ---------------------------------------------------------------------
 ALTER TABLE ticks SET (
     timescaledb.compress,
     timescaledb.compress_segmentby = 'symbol,exchange',
-    timescaledb.compress_orderby = 'ts DESC'
+    timescaledb.compress_orderby   = 'ts DESC'
 );
 
 SELECT add_compression_policy('ticks', INTERVAL '7 days', if_not_exists => TRUE);
 
 -- ---------------------------------------------------------------------
--- 4) collector_gaps — v5: UNIQUE constraint (ON CONFLICT safe)
+-- 4) Retention (optional) — 1 साल से पुराना data delete करो
+-- ---------------------------------------------------------------------
+-- SELECT add_retention_policy('ticks', INTERVAL '365 days', if_not_exists => TRUE);
+
+-- ---------------------------------------------------------------------
+-- 5) collector_gaps — disconnect periods log
+--    हर gap window track करता है ताकि बाद में gap_filler उसे history से भर सके
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS collector_gaps (
     id              BIGSERIAL    PRIMARY KEY,
-    started_at      TIMESTAMPTZ  NOT NULL,
-    ended_at        TIMESTAMPTZ  NOT NULL,
-    reason          TEXT,
-    filled          BOOLEAN      DEFAULT FALSE,
-    attempts        INT          DEFAULT 0,
-    failed_symbols  TEXT[]       DEFAULT '{}'::TEXT[],
-    last_error      TEXT,
-    last_attempt_at TIMESTAMPTZ
+    started_at      TIMESTAMPTZ  NOT NULL,             -- gap शुरू हुआ
+    ended_at        TIMESTAMPTZ  NOT NULL,             -- gap खत्म हुआ
+    reason          TEXT,                              -- कारण: ws_reconnect, startup_gap...
+    filled          BOOLEAN      DEFAULT FALSE,        -- क्या gap भर गया?
+    attempts        INT          DEFAULT 0,            -- कितनी बार कोशिश हुई
+    failed_symbols  TEXT[]       DEFAULT '{}'::TEXT[], -- कौन से symbols fail हुए
+    last_error      TEXT,                              -- last error message
+    last_attempt_at TIMESTAMPTZ                        -- last try कब हुआ
 );
 
+-- सिर्फ़ unfilled gaps के लिए index (faster lookup)
 CREATE INDEX IF NOT EXISTS idx_gaps_unfilled
     ON collector_gaps (started_at) WHERE filled = FALSE;
 
--- v5 FIX: gap-spool replay duplicates के लिए unique constraint
+-- gap-spool replay duplicates से बचाव के लिए unique constraint
 CREATE UNIQUE INDEX IF NOT EXISTS uq_collector_gaps_window
     ON collector_gaps (started_at, ended_at, COALESCE(reason, ''));
 
 -- ---------------------------------------------------------------------
--- 5) ohlc_1m_filled
+-- 6) ohlc_1m_filled — gap_filler.py द्वारा भरी हुई 1-min bars
+--    जब live data नहीं था (disconnect period), तब broker history API से
+--    1-minute candles लाकर यहाँ store करते हैं
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS ohlc_1m_filled (
-    ts          TIMESTAMPTZ NOT NULL,
+    ts          TIMESTAMPTZ NOT NULL,           -- bar का timestamp
     exchange    TEXT        NOT NULL,
     symbol      TEXT        NOT NULL,
     open        DOUBLE PRECISION,
@@ -138,7 +151,7 @@ CREATE TABLE IF NOT EXISTS ohlc_1m_filled (
     low         DOUBLE PRECISION,
     close       DOUBLE PRECISION,
     volume      BIGINT,
-    source      TEXT        DEFAULT 'history_api',
+    source      TEXT        DEFAULT 'history_api',  -- कहाँ से आया
     PRIMARY KEY (ts, symbol, exchange)
 );
 
@@ -149,13 +162,17 @@ SELECT create_hypertable(
 );
 
 -- ---------------------------------------------------------------------
--- 6) Views — v5 fixes:
---    * gap_minutes: time_bucket floor on BOTH ends (last partial minute fix)
---    * v_quotes_1m_raw: history filter (live missing/partial only)
---    * v_quotes_1m: priority full > sparse > history > partial
+-- 7) v_quotes_1m_raw — raw forensic view
+--    हर 1-min bucket को 'full', 'partial', 'sparse', या 'history' label देता है
+--    quality matrix:
+--      gap_minutes overlap: हाँ      → 'partial'
+--      live coverage ≥ 10s, no gap   → 'full'
+--      live coverage <10s, no gap    → 'sparse'   (low-liquidity)
+--      ohlc_1m_filled से आया         → 'history'
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE VIEW v_quotes_1m_raw AS
 WITH live_1m AS (
+    -- 1-second buckets को 1-minute में aggregate करो
     SELECT
         time_bucket('1 minute', bucket) AS ts,
         exchange,
@@ -165,12 +182,12 @@ WITH live_1m AS (
         min(low)                        AS low,
         last(close, bucket)             AS close,
         COALESCE(SUM(volume), 0)::BIGINT AS volume,
-        COUNT(*)                        AS sec_count
+        COUNT(*)                        AS sec_count   -- कितने seconds में data था
     FROM ohlc_1s
     GROUP BY 1, 2, 3
 ),
 gap_minutes AS (
-    -- v5 FIX: time_bucket floor for start & end (partial minutes covered)
+    -- collector_gaps के सारे minutes (1-min boundary पर)
     SELECT DISTINCT gs AS ts
     FROM collector_gaps g
     CROSS JOIN LATERAL generate_series(
@@ -179,19 +196,20 @@ gap_minutes AS (
         '1 minute'::interval
     ) AS gs
 )
+-- Live data (हर minute के लिए quality label)
 SELECT
     lm.ts, lm.exchange, lm.symbol,
     lm.open, lm.high, lm.low, lm.close, lm.volume,
     'tick' AS source,
     CASE
-        WHEN gm.ts IS NOT NULL    THEN 'partial'
-        WHEN lm.sec_count >= 10   THEN 'full'
-        ELSE                            'sparse'
+        WHEN gm.ts IS NOT NULL    THEN 'partial'   -- gap overlap → partial
+        WHEN lm.sec_count >= 10   THEN 'full'      -- अच्छी coverage
+        ELSE                            'sparse'   -- low-liquidity
     END AS quality
 FROM   live_1m lm
 LEFT JOIN gap_minutes gm ON gm.ts = lm.ts
 UNION ALL
--- v5 FIX: history सिर्फ़ तब include करो जब live data missing OR partial हो
+-- History data (सिर्फ़ तब include जब live missing या gap में हो)
 SELECT
     f.ts, f.exchange, f.symbol,
     f.open, f.high, f.low, f.close, f.volume,
@@ -206,8 +224,12 @@ LEFT JOIN gap_minutes gm
        ON gm.ts       = date_trunc('minute', f.ts)
 WHERE  lm.ts IS NULL OR gm.ts IS NOT NULL;
 
--- v5 FIX: clean view priority — live real data हमेशा > history fill
--- full (अच्छा coverage, no gap) > sparse (real low-liquidity) > history > partial (live पर gap भी)
+-- ---------------------------------------------------------------------
+-- 8) v_quotes_1m — clean ML training feed
+--    DISTINCT ON से duplicates हटाता है, quality priority के साथ:
+--      full > sparse > history > partial
+--    (live real data हमेशा > history fill, sparse > history)
+-- ---------------------------------------------------------------------
 CREATE OR REPLACE VIEW v_quotes_1m AS
 SELECT DISTINCT ON (ts, exchange, symbol)
        ts, exchange, symbol, open, high, low, close, volume, source, quality

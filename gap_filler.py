@@ -1,14 +1,21 @@
 """
-Gap Filler  (v5 — round-4 review fixes)
-========================================
-v5 sudhar:
-  * --today: IST timezone-aware day boundary (Qwen #2 fix)
-  * df_rows_in_window: list/dict response defensive parsing (Gemini, Qwen #4)
-  * NSE holidays: closed_exchanges + multi-format date parser + dynamic years
-  * fill_one_gap: failure ONLY on API errors (failed_days), not 0-rows
-                  (15:25-15:35 type gaps no longer false-fail)
-  * SQL composition via psycopg.sql (no string formatting injection)
-  * pool.close() in finally
+Gap Filler
+==========
+Disconnect periods के 1-minute OHLC bars को OpenAlgo history API से
+ohlc_1m_filled table में भरता है।
+
+Usage:
+    python gap_filler.py            # सारे unfilled gaps
+    python gap_filler.py --today    # सिर्फ़ आज के
+    python gap_filler.py --retry    # जिनमें पहले attempts हुए
+
+Features:
+  • NSE holiday-aware (settlement holidays skip)
+  • Day-by-day chunking (broker 1m API limit avoid)
+  • Per-symbol retry tracking
+  • Market-hours validation (data quality enforcement)
+  • Pool retry on startup (DB transient outages handle)
+  • SQL injection-safe (psycopg.sql composition)
 """
 from __future__ import annotations
 
@@ -27,11 +34,15 @@ from psycopg import sql
 from psycopg.conninfo import make_conninfo
 from psycopg_pool import ConnectionPool
 
+# ===========================================================================
+# Configuration
+# ===========================================================================
 load_dotenv()
 
 OPENALGO_API_KEY = os.environ["OPENALGO_API_KEY"]
 OPENALGO_HOST    = os.getenv("OPENALGO_HOST", "http://127.0.0.1:5000")
 
+# DB connection string (special-char passwords के लिए make_conninfo)
 PG_DSN = make_conninfo(
     host     = os.getenv("PG_HOST", "127.0.0.1"),
     port     = int(os.getenv("PG_PORT", "5432")),
@@ -40,24 +51,27 @@ PG_DSN = make_conninfo(
     password = os.getenv("PG_PASSWORD", ""),
 )
 
-EXCHANGE     = os.getenv("EXCHANGE", "NSE")
+EXCHANGE     = os.getenv("EXCHANGE", "NSE")              # NSE/BSE
 SYMBOLS_FILE = os.getenv("SYMBOLS_FILE", "symbols.txt")
-INTERVAL     = "1m"
+INTERVAL     = "1m"                                       # broker history interval
 
+# Logging setup
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("gap_filler")
 
-IST = timezone(timedelta(hours=5, minutes=30))
+# Indian market hours
+IST          = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN  = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
 
 
-# ---------------------------------------------------------------------------
-# SQL — v5 FIX: psycopg.sql composition (no string formatting)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# SQL templates
+# ===========================================================================
+# 1-min OHLC bar insert (ON CONFLICT DO NOTHING से idempotent)
 INSERT_BAR = """
 INSERT INTO ohlc_1m_filled (ts, exchange, symbol, open, high, low, close,
                             volume, source)
@@ -65,6 +79,7 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'history_api')
 ON CONFLICT (ts, symbol, exchange) DO NOTHING
 """
 
+# Gap status update — attempts increment, failed_symbols save
 UPDATE_GAP = """
 UPDATE collector_gaps
 SET    filled          = %s,
@@ -77,10 +92,16 @@ WHERE  id = %s
 
 
 def build_gap_query(today: bool, retry: bool) -> sql.SQL:
+    """
+    Unfilled gaps की SQL query बनाता है — psycopg.sql composition (no injection)।
+
+    --today: आज (IST) ended_at वाले gaps (Friday→Monday startup_gap भी match)
+    --retry: सिर्फ़ वो जिनमें पहले attempts हुए
+    """
     conditions: list[sql.Composable] = [sql.SQL("filled = FALSE")]
     if today:
-        # v6 FIX (Gemini, Kimi #3): `ended_at` use करो — Friday→Monday वाला
-        # startup_gap भी आज के ended_at से match होगा।
+        # ended_at use करते हैं ताकि Friday→Monday वाला gap भी match हो
+        # (started_at Friday है, पर ended_at Monday morning है → आज matches)
         conditions.append(sql.SQL(
             "ended_at >= (now() AT TIME ZONE 'Asia/Kolkata')::date "
             "AT TIME ZONE 'Asia/Kolkata'"
@@ -93,15 +114,15 @@ def build_gap_query(today: bool, retry: bool) -> sql.SQL:
     ).format(conds=sql.SQL(" AND ").join(conditions))
 
 
-# ---------------------------------------------------------------------------
-# NSE holiday cache
-# v6 FIX (Qwen): cached years track करो — repeat API calls avoid
-# ---------------------------------------------------------------------------
-_HOLIDAYS:    set[date] | None = None
-_LOADED_YEARS: set[int]        = set()
+# ===========================================================================
+# NSE holiday cache (OpenAlgo API से fetch + multi-year cache)
+# ===========================================================================
+_HOLIDAYS:    set[date] | None = None     # cached holiday dates
+_LOADED_YEARS: set[int]        = set()    # कौन से years load हो चुके हैं
 
 
 def _parse_holiday_date(s: Any) -> date | None:
+    """Multi-format date parser — broker कई तरह की string भेजते हैं।"""
     if not s:
         return None
     s = str(s).strip()
@@ -117,12 +138,16 @@ def _parse_holiday_date(s: Any) -> date | None:
 
 
 def _load_holidays(client, years: set[int] | None = None) -> set[date]:
+    """
+    OpenAlgo client.holidays() से holidays cache करता है।
+    सिर्फ़ missing years के लिए API call करता है (redundant calls avoid)।
+    Settlement holidays और non-NSE-closed days को skip करता है।
+    """
     global _HOLIDAYS, _LOADED_YEARS
     if _HOLIDAYS is None:
         _HOLIDAYS = set()
 
     target_years = years or {datetime.now(IST).year}
-    # v6 FIX (Qwen): सिर्फ़ missing years के लिए API call
     years_to_fetch = target_years - _LOADED_YEARS
     if not years_to_fetch:
         return _HOLIDAYS
@@ -132,9 +157,10 @@ def _load_holidays(client, years: set[int] | None = None) -> set[date]:
             resp = client.holidays(year=y)
         except Exception as e:                                   # noqa: BLE001
             log.warning("holidays(%d) API fail: %s", y, e)
-            _LOADED_YEARS.add(y)   # don't retry this run
+            _LOADED_YEARS.add(y)                                 # don't retry this run
             continue
 
+        # Response shape varies broker-to-broker
         items: list = []
         if isinstance(resp, dict):
             for k in ("data", "holidays", "result"):
@@ -145,7 +171,6 @@ def _load_holidays(client, years: set[int] | None = None) -> set[date]:
         elif isinstance(resp, list):
             items = resp
         else:
-            # v7 FIX (Qwen): unexpected type — debugging के लिए warning
             log.warning("unexpected holidays(%d) response type: %s",
                         y, type(resp).__name__)
 
@@ -153,20 +178,22 @@ def _load_holidays(client, years: set[int] | None = None) -> set[date]:
             if not isinstance(h, dict):
                 continue
 
-            # v6 FIX (Kimi #9): empty list = "no exchanges closed" = NSE open
+            # Closed-exchanges check: empty list = NSE open (not a holiday)
             closed = h.get("closed_exchanges")
             if closed is None:
                 closed = h.get("closed")
             if isinstance(closed, list):
                 if not closed:
-                    continue                          # NSE open
+                    continue                                     # कोई exchange बंद नहीं
                 if EXCHANGE not in closed:
-                    continue
+                    continue                                     # NSE खुला है
 
+            # Settlement holiday vs trading holiday distinguish
             htype = (h.get("holiday_type") or h.get("type") or "").upper()
             if htype and htype not in ("TRADING_HOLIDAY", "TRADING", ""):
                 continue
 
+            # Date extract
             d_str = h.get("date") or h.get("holiday_date") or h.get("day")
             d = _parse_holiday_date(d_str)
             if d:
@@ -180,7 +207,8 @@ def _load_holidays(client, years: set[int] | None = None) -> set[date]:
 
 
 def is_trading_day(d: date, client=None) -> bool:
-    if d.weekday() > 4:
+    """क्या यह date NSE trading day है? (Mon-Fri minus holidays)"""
+    if d.weekday() > 4:                                          # Sat/Sun
         return False
     if client is not None:
         if d in _load_holidays(client):
@@ -188,27 +216,33 @@ def is_trading_day(d: date, client=None) -> bool:
     return True
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Helpers
+# ===========================================================================
 def load_symbols(path: str) -> list[str]:
+    """symbols.txt से list load (comments ignore)।"""
     return [s.strip() for s in Path(path).read_text().splitlines()
             if s.strip() and not s.strip().startswith("#")]
 
 
 def floor_minute(dt: datetime) -> datetime:
+    """Datetime को minute boundary पर truncate (seconds & microseconds zero)।"""
     return dt.replace(second=0, microsecond=0)
 
 
 def date_range(d_start: date, d_end: date) -> Iterator[date]:
+    """Iterate dates from d_start to d_end (inclusive)।"""
     d = d_start
     while d <= d_end:
         yield d
         d += timedelta(days=1)
 
 
-def gap_overlaps_market_hours(start: datetime, end: datetime, client=None) -> bool:
+def gap_overlaps_market_hours(start: datetime, end: datetime,
+                              client=None) -> bool:
     """
-    Gap window में कोई trading-day market-hours overlap है या नहीं।
-    v8 SELF-AUDIT: अब actually use हो रहा है — fill_one_gap में strict check।
+    Check करता है कि gap window में किसी trading day का market-hours
+    portion overlap है या नहीं। Holiday-aware।
     """
     start_ist = start.astimezone(IST)
     end_ist   = end.astimezone(IST)
@@ -218,22 +252,28 @@ def gap_overlaps_market_hours(start: datetime, end: datetime, client=None) -> bo
         if is_trading_day(cur_day, client):
             day_open  = datetime.combine(cur_day, MARKET_OPEN,  tzinfo=IST)
             day_close = datetime.combine(cur_day, MARKET_CLOSE, tzinfo=IST)
+            # Standard interval overlap check
             if start_ist <= day_close and end_ist >= day_open:
                 return True
         cur_day += timedelta(days=1)
     return False
 
 
+# ===========================================================================
+# History API wrapper (defensive parsing)
+# ===========================================================================
 def fetch_history(client, symbol: str, sd: str, ed: str
                   ) -> tuple[Any | None, bool]:
     """
-    v6 FIX (Kimi #4): tuple (df, had_api_error) return करो ताकि
-    "0 rows" को "API failure" से distinguish कर सकें।
+    OpenAlgo history API से 1-min bars fetch करता है।
 
-    Returns:
-      (df, False)   — successful, df has rows
-      (None, False) — successful, but no rows (illiquid / no-trade day)
-      (None, True)  — API exception thrown
+    Returns: (df, had_api_error)
+      (DataFrame, False) — successful, df has rows
+      (None,      False) — successful, but no rows (illiquid/holiday)
+      (None,      True ) — API exception OR JSON error response
+
+    Broker कभी-कभी 200 OK में भी {"status":"error", ...} भेजते हैं —
+    इसे explicitly detect करते हैं ताकि silent data loss न हो।
     """
     try:
         df = client.history(
@@ -245,17 +285,16 @@ def fetch_history(client, symbol: str, sd: str, ed: str
         )
     except Exception as e:                                       # noqa: BLE001
         log.warning("history fail %s [%s..%s]: %s", symbol, sd, ed, e)
-        return None, True                                        # API error
+        return None, True
 
     if df is None:
-        return None, False                                       # no error, no data
+        return None, False
 
-    # if not a DataFrame, try to convert
+    # अगर DataFrame नहीं है तो convert करो
     if not hasattr(df, "iterrows"):
         try:
             if isinstance(df, dict):
-                # v7 FIX (Gemini #2): explicit API JSON error detection
-                # broker कभी-कभी 200 OK में भी {"status":"error", ...} भेजता है
+                # API JSON error detection
                 status_str = str(df.get("status", "")).lower()
                 if (status_str in ("error", "failure", "fail")
                         or df.get("error")
@@ -265,19 +304,21 @@ def fetch_history(client, symbol: str, sd: str, ed: str
                         symbol,
                         df.get("message") or df.get("error") or df,
                     )
-                    return None, True                            # treat as API error
+                    return None, True
 
+                # Common response keys try करो
                 df = (df.get("data") or df.get("candles") or
                       df.get("history") or [])
+
             df = pd.DataFrame(df)
-            # v6 FIX (Kimi #6): broker-specific column names cover करो
+            # Timestamp column variations cover करो
             for col in ("timestamp", "time", "ts", "date",
                         "datetime", "t", "dt"):
                 if col in df.columns:
                     df = df.set_index(col)
                     break
             else:
-                # कोई recognized ts column नहीं — index check करो
+                # कोई recognized column नहीं — index already datetime हो शायद
                 if not (hasattr(df.index, "to_pydatetime")
                         or (len(df.index) > 0
                             and isinstance(df.index[0],
@@ -299,15 +340,20 @@ def fetch_history(client, symbol: str, sd: str, ed: str
 
 def df_rows_in_window(df, start: datetime, end: datetime,
                       symbol: str) -> list[tuple]:
+    """
+    DataFrame से gap window के bars निकालता है।
+    Defensive parsing: NaN volume row को drop नहीं करता (OHLC preserve करता है)।
+    """
     start_floor = floor_minute(start)
     end_floor   = floor_minute(end)
     rows: list[tuple] = []
+
     for ts, row in df.iterrows():
-        # v5/v7 FIX: defensive ts conversion (numeric epoch भी handle)
+        # Timestamp को tz-aware UTC datetime में convert
         if hasattr(ts, "to_pydatetime"):
             py_ts = ts.to_pydatetime()
         elif isinstance(ts, (int, float)):
-            # v7 FIX (ChatGPT #3): broker कभी-कभी unix epoch भेजता है
+            # Broker कभी-कभी unix epoch भेजते हैं
             ts_val = ts / 1000.0 if abs(ts) > 1e12 else float(ts)
             try:
                 py_ts = datetime.fromtimestamp(ts_val, tz=timezone.utc)
@@ -322,14 +368,17 @@ def df_rows_in_window(df, start: datetime, end: datetime,
             py_ts = ts
         else:
             continue
+
+        # Naive timestamp = IST (broker default)
         if py_ts.tzinfo is None:
             py_ts = py_ts.replace(tzinfo=IST)
         ts_utc = py_ts.astimezone(timezone.utc)
+
+        # Window filter (minute floor पर inclusive)
         if not (start_floor <= ts_utc <= end_floor):
             continue
 
-        # v7 FIX (Gemini #4 / Qwen #2): NaN/string-volume row drop न करे —
-        # सिर्फ़ volume = None, OHLC अब भी valid → row preserve
+        # OHLC parse — fail = drop entire row
         try:
             ohlc = (
                 float(row["open"]),
@@ -341,6 +390,8 @@ def df_rows_in_window(df, start: datetime, end: datetime,
             log.warning("OHLC parse fail %s @ %s: %s", symbol, ts_utc, e)
             continue
 
+        # Volume parse — fail = volume None, OHLC preserve
+        # (NaN/string volume row को drop नहीं करना)
         vol_raw = row.get("volume") if hasattr(row, "get") else (
             row["volume"] if "volume" in row else None
         )
@@ -363,38 +414,45 @@ def fetch_history_chunked(client, symbol: str,
                           start: datetime, end: datetime
                           ) -> tuple[list[tuple], list[date]]:
     """
-    v6 FIX (Kimi #4): failed_days अब सिर्फ़ true API errors के लिए;
-    successful empty results (illiquid stock, no-trade day) failure नहीं।
+    Multi-day gap → day-by-day API call (broker 1m limit avoid)।
+    Holiday days को skip करता है। failed_days सिर्फ़ true API errors के लिए।
+
+    Returns: (all_rows, failed_days)
     """
     start_ist = start.astimezone(IST).date()
     end_ist   = end.astimezone(IST).date()
-    all_rows: list[tuple] = []
+    all_rows:    list[tuple] = []
     failed_days: list[date] = []
+
     for day in date_range(start_ist, end_ist):
         if not is_trading_day(day, client):
-            continue
+            continue                                             # holiday skip
         sd = ed = day.isoformat()
         df, had_error = fetch_history(client, symbol, sd, ed)
         if had_error:
-            failed_days.append(day)
+            failed_days.append(day)                              # API error
             continue
         if df is None:
-            # API succeeded but no rows — not a failure
-            continue
+            continue                                             # 0 rows OK
         all_rows.extend(df_rows_in_window(df, start, end, symbol))
+
     return all_rows, failed_days
 
 
+# ===========================================================================
+# Main gap-fill logic
+# ===========================================================================
 def fill_one_gap(client, pool, gid: int, start: datetime, end: datetime,
                  symbols: list[str]) -> tuple[int, list[str], str | None]:
     """
+    एक gap के लिए सब symbols की 1-min bars fill करता है।
+
     Failure logic:
-      • API errored (failed_days non-empty) → failed
-      • 0 rows + market-hours overlap (Nifty 50 active) → failed
-        (v8 SELF-AUDIT: revived gap_overlaps_market_hours check; ChatGPT
-        round-6 raised this as "ML data quality" concern — silent 0-row
-        success was hiding broker timestamp/symbol mismatches)
-      • 0 rows + after-hours/holiday-only gap → success (no data expected)
+      • API errored (failed_days non-empty)        → failed
+      • 0 rows + market-hours overlap (Nifty 50)    → failed (suspicious)
+      • 0 rows + after-hours/holiday-only           → success (no data expected)
+
+    Returns: (inserted_rows_count, failed_symbol_list, last_error_message)
     """
     inserted = 0
     failed: list[str] = []
@@ -404,24 +462,29 @@ def fill_one_gap(client, pool, gid: int, start: datetime, end: datetime,
     for sym in symbols:
         rows, failed_days = fetch_history_chunked(client, sym, start, end)
 
+        # API error — true failure
         if failed_days:
             failed.append(sym)
             last_err = f"API failed for {len(failed_days)} day(s) on {sym}"
             log.warning("gap %d | %s: API fail on %d days", gid, sym, len(failed_days))
             continue
 
+        # 0 rows — context पर depend
         if not rows:
             if market_gap:
-                # v8: market-hours में Nifty 50 stocks का 0-rows = suspicious
+                # Market hours में Nifty 50 stocks का 0-rows = suspicious
+                # (broker timestamp mismatch, symbol issue, data delay)
                 failed.append(sym)
                 last_err = (f"0 bars in market-hours gap for {sym} "
                             f"(broker data delay / symbol mismatch?)")
                 log.warning("gap %d | %s: 0 bars in market-hours window", gid, sym)
             else:
+                # After-hours/holiday-only gap — 0 rows expected
                 log.debug("gap %d | %s: 0 bars (after-hours/holiday only — OK)",
                           gid, sym)
             continue
 
+        # Insert करो
         try:
             with pool.connection() as con, con.cursor() as cur:
                 cur.executemany(INSERT_BAR, rows)
@@ -435,8 +498,11 @@ def fill_one_gap(client, pool, gid: int, start: datetime, end: datetime,
     return inserted, failed, last_err
 
 
+# ===========================================================================
+# DB pool — startup retry (cron resilience)
+# ===========================================================================
 def make_pool_with_retry() -> ConnectionPool:
-    """v6 FIX (Kimi #5): symmetric with collector — DB startup retry।"""
+    """DB pool with 10-attempt exponential backoff (collector के symmetric)।"""
     pool = ConnectionPool(PG_DSN, min_size=1, max_size=2, open=False,
                           kwargs={"autocommit": True})
     last_err: Exception | None = None
@@ -455,6 +521,9 @@ def make_pool_with_retry() -> ConnectionPool:
     raise RuntimeError(f"DB unreachable after 10 retries: {last_err}")
 
 
+# ===========================================================================
+# Main entry point
+# ===========================================================================
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--today", action="store_true",
@@ -468,6 +537,7 @@ def main() -> None:
 
     pool = make_pool_with_retry()
     try:
+        # Unfilled gaps fetch करो
         query = build_gap_query(today=args.today, retry=args.retry)
         with pool.connection() as con, con.cursor() as cur:
             cur.execute(query)
@@ -478,18 +548,22 @@ def main() -> None:
             return
 
         log.info("processing %d gaps", len(gaps))
+
+        # OpenAlgo client + holiday cache warm
         client = api(api_key=OPENALGO_API_KEY, host=OPENALGO_HOST)
 
-        # v5 FIX: dynamic year range from gap dates
+        # सब gaps के years एक साथ load कर लो (efficient API usage)
         gap_years = {g[1].astimezone(IST).year for g in gaps} | \
                     {g[2].astimezone(IST).year for g in gaps}
         _load_holidays(client, years=gap_years)
 
         total_rows = 0
         for gid, start, end, reason, attempts, prev_failed in gaps:
+            # बहुत छोटे gaps (e.g., 5-sec hiccup) के लिए minimum 1-min window
             if (end - start) < timedelta(minutes=1):
                 end = start + timedelta(minutes=1)
 
+            # Retry mode में सिर्फ़ failed symbols, normal में सब
             target_symbols = list(prev_failed) if prev_failed else symbols
             log.info("→ gap %d | %s → %s | symbols=%d | attempts=%d | %s",
                      gid, start, end, len(target_symbols), attempts, reason)
@@ -499,6 +573,7 @@ def main() -> None:
             )
             total_rows += ins
 
+            # Status update — सब symbols success पर ही mark filled
             is_done = len(failed) == 0
             with pool.connection() as con, con.cursor() as cur:
                 cur.execute(UPDATE_GAP, (is_done, failed, last_err, gid))
