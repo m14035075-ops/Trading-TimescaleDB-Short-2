@@ -1,23 +1,19 @@
 -- =====================================================================
--- NSE Tick Collector — TimescaleDB Schema  (v4 — round-3 review fixes)
+-- NSE Tick Collector — TimescaleDB Schema  (v5 — round-4 review fixes)
 -- =====================================================================
---
 -- नए install पर:
 --     psql -U postgres -d marketdata -f schema.sql
 --
--- पुराने (v2/v3) DB से upgrade पर — पहले एक बार:
---     DROP MATERIALIZED VIEW IF EXISTS ohlc_1s CASCADE;
---     DROP VIEW IF EXISTS v_quotes_1m;
---     DROP VIEW IF EXISTS v_quotes_1m_raw;
--- फिर schema.sql चलाएँ। (नए columns ALTER से idempotent जुड़ जाएँगे।)
---
--- TimescaleDB extension पहले से installed होनी चाहिए।
+-- पुराने (v2/v3/v4) DB से upgrade — सिर्फ़ views drop करें
+-- (CAGG `ohlc_1s` को drop मत करें — सब historical data चला जाएगा):
+--     DROP VIEW IF EXISTS v_quotes_1m, v_quotes_1m_raw;
+-- फिर schema.sql चलाएँ। ALTER TABLE से नए columns idempotent जुड़ेंगे।
 -- =====================================================================
 
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
 -- ---------------------------------------------------------------------
--- 1) ticks  — हर WebSocket tick (quote OR depth)
+-- 1) ticks
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS ticks (
     ts          TIMESTAMPTZ      NOT NULL,
@@ -38,7 +34,7 @@ CREATE TABLE IF NOT EXISTS ticks (
     tick_uid    TEXT
 );
 
--- Idempotent migration: पुराने schemas से columns missing हों तो जोड़ दे
+-- Idempotent migration columns
 ALTER TABLE ticks ADD COLUMN IF NOT EXISTS stream_type TEXT;
 ALTER TABLE ticks ALTER COLUMN stream_type SET DEFAULT 'quote';
 UPDATE ticks SET stream_type = 'quote' WHERE stream_type IS NULL;
@@ -57,18 +53,12 @@ SELECT create_hypertable(
 CREATE INDEX IF NOT EXISTS idx_ticks_ex_sym_ts
     ON ticks (exchange, symbol, ts DESC);
 
--- Spool replay duplicate से बचाव: ts + tick_uid पर unique
--- (TimescaleDB hypertable में partition column ts include होना ज़रूरी)
+-- v5: 32-char SHA-256 tick_uid → spool replay safe
 CREATE UNIQUE INDEX IF NOT EXISTS uq_ticks_dedupe
     ON ticks (ts, tick_uid);
 
 -- ---------------------------------------------------------------------
--- 2) ohlc_1s  — 1-second OHLCV continuous aggregate
---
---    Note: CAGG यह assume करता है कि एक समय पर सिर्फ़ एक mode चल रहा है
---    (MODE=quote XOR MODE=depth)। दोनों stream_types का LTP/volume same
---    cumulative counter से आता है, इसलिए mixing harmless है, बस tick_count
---    inflate हो सकता है। forensic detail चाहिए तो ticks table से query करें।
+-- 2) ohlc_1s — 1-second OHLCV continuous aggregate
 -- ---------------------------------------------------------------------
 CREATE MATERIALIZED VIEW IF NOT EXISTS ohlc_1s
 WITH (timescaledb.continuous, timescaledb.materialized_only = false) AS
@@ -93,7 +83,7 @@ SELECT add_continuous_aggregate_policy('ohlc_1s',
     if_not_exists => TRUE);
 
 -- ---------------------------------------------------------------------
--- 3) Compression — 7 दिन से पुराना (~10x storage saving)
+-- 3) Compression
 -- ---------------------------------------------------------------------
 ALTER TABLE ticks SET (
     timescaledb.compress,
@@ -104,12 +94,7 @@ ALTER TABLE ticks SET (
 SELECT add_compression_policy('ticks', INTERVAL '7 days', if_not_exists => TRUE);
 
 -- ---------------------------------------------------------------------
--- 4) Retention (optional)
--- ---------------------------------------------------------------------
--- SELECT add_retention_policy('ticks', INTERVAL '365 days', if_not_exists => TRUE);
-
--- ---------------------------------------------------------------------
--- 5) collector_gaps — disconnect periods (per-symbol retry)
+-- 4) collector_gaps — v5: UNIQUE constraint (ON CONFLICT safe)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS collector_gaps (
     id              BIGSERIAL    PRIMARY KEY,
@@ -126,8 +111,12 @@ CREATE TABLE IF NOT EXISTS collector_gaps (
 CREATE INDEX IF NOT EXISTS idx_gaps_unfilled
     ON collector_gaps (started_at) WHERE filled = FALSE;
 
+-- v5 FIX: gap-spool replay duplicates के लिए unique constraint
+CREATE UNIQUE INDEX IF NOT EXISTS uq_collector_gaps_window
+    ON collector_gaps (started_at, ended_at, COALESCE(reason, ''));
+
 -- ---------------------------------------------------------------------
--- 6) ohlc_1m_filled — gap_filler.py history bars
+-- 5) ohlc_1m_filled
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS ohlc_1m_filled (
     ts          TIMESTAMPTZ NOT NULL,
@@ -149,17 +138,10 @@ SELECT create_hypertable(
 );
 
 -- ---------------------------------------------------------------------
--- 7) Views: v_quotes_1m_raw (forensic — duplicates allowed)
---           v_quotes_1m     (clean — DISTINCT ON + quality priority)
---
---    quality column ML training में filter के लिए:
---      'full'    → live data, कोई gap overlap नहीं, tick coverage अच्छी
---      'partial' → live data था पर इस minute में disconnect-gap overlap
---      'sparse'  → live data था, gap नहीं, लेकिन कम trades (low liquidity)
---      'history' → disconnect period में history API से भरा
---
---    Strict ML feed के लिए:  v_quotes_1m WHERE quality IN ('full','history')
---    Low-liquidity OK:        v_quotes_1m WHERE quality != 'partial'
+-- 6) Views — v5 fixes:
+--    * gap_minutes: time_bucket floor on BOTH ends (last partial minute fix)
+--    * v_quotes_1m_raw: history filter (live missing/partial only)
+--    * v_quotes_1m: priority full > sparse > history > partial
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE VIEW v_quotes_1m_raw AS
 WITH live_1m AS (
@@ -177,44 +159,44 @@ WITH live_1m AS (
     GROUP BY 1, 2, 3
 ),
 gap_minutes AS (
-    -- collector_gaps के सारे minutes (1-min boundary पर expand)
-    SELECT DISTINCT
-        time_bucket('1 minute', g) AS ts
-    FROM (
-        SELECT generate_series(started_at, ended_at, '1 minute'::interval) AS g
-        FROM collector_gaps
-    ) x
+    -- v5 FIX: time_bucket floor for start & end (partial minutes covered)
+    SELECT DISTINCT gs AS ts
+    FROM collector_gaps g
+    CROSS JOIN LATERAL generate_series(
+        time_bucket('1 minute', g.started_at),
+        time_bucket('1 minute', g.ended_at),
+        '1 minute'::interval
+    ) AS gs
 )
--- live row (always present) — quality gap-overlap और sec_count से
 SELECT
     lm.ts, lm.exchange, lm.symbol,
     lm.open, lm.high, lm.low, lm.close, lm.volume,
     'tick' AS source,
     CASE
-        WHEN gm.ts IS NOT NULL              THEN 'partial'
-        WHEN lm.sec_count >= 10             THEN 'full'
-        ELSE                                     'sparse'
+        WHEN gm.ts IS NOT NULL    THEN 'partial'
+        WHEN lm.sec_count >= 10   THEN 'full'
+        ELSE                            'sparse'
     END AS quality
-FROM live_1m lm
+FROM   live_1m lm
 LEFT JOIN gap_minutes gm ON gm.ts = lm.ts
 UNION ALL
--- history row — सिर्फ़ तब जब live data नहीं है, या live partial है
+-- v5 FIX: history सिर्फ़ तब include करो जब live data missing OR partial हो
 SELECT
     f.ts, f.exchange, f.symbol,
     f.open, f.high, f.low, f.close, f.volume,
     f.source,
     'history' AS quality
-FROM ohlc_1m_filled f
+FROM   ohlc_1m_filled f
 LEFT JOIN live_1m lm
        ON lm.ts       = date_trunc('minute', f.ts)
       AND lm.exchange = f.exchange
       AND lm.symbol   = f.symbol
 LEFT JOIN gap_minutes gm
-       ON gm.ts       = date_trunc('minute', f.ts);
--- नोट: यहाँ duplicate possible है (live partial + history) — clean view
--- नीचे DISTINCT ON से एक ही row देता है, quality priority के साथ।
+       ON gm.ts       = date_trunc('minute', f.ts)
+WHERE  lm.ts IS NULL OR gm.ts IS NOT NULL;
 
--- Clean view — ML training के लिए recommended
+-- v5 FIX: clean view priority — live real data हमेशा > history fill
+-- full (अच्छा coverage, no gap) > sparse (real low-liquidity) > history > partial (live पर gap भी)
 CREATE OR REPLACE VIEW v_quotes_1m AS
 SELECT DISTINCT ON (ts, exchange, symbol)
        ts, exchange, symbol, open, high, low, close, volume, source, quality
@@ -222,7 +204,7 @@ FROM   v_quotes_1m_raw
 ORDER  BY ts, exchange, symbol,
     CASE quality
         WHEN 'full'    THEN 1
-        WHEN 'history' THEN 2
-        WHEN 'sparse'  THEN 3
+        WHEN 'sparse'  THEN 2
+        WHEN 'history' THEN 3
         WHEN 'partial' THEN 4
     END;

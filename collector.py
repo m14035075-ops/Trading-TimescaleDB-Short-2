@@ -1,16 +1,20 @@
 """
-NSE Tick Collector  (v4 — round-3 review fixes)
+NSE Tick Collector  (v5 — round-4 review fixes)
 ================================================
-OpenAlgo WebSocket -> Buffer -> TimescaleDB (batch insert)
+v5 sudhar (round-4 — ChatGPT + Gemini + Qwen + Kimi):
 
-v4 में लागू सुधार (round-3 — ChatGPT + Gemini):
-  1. Day-rollover late-start volume fix (तुरंत 9:30 IST के बाद = return 0)
-  2. tick_uid (SHA1 hash) + ON CONFLICT DO NOTHING — spool replay safe
-  3. Numeric string timestamp ('1717741500000') ठीक से parse होगा
-  4. Gap recording fail पर gap_spool JSONL + startup replay
-  5. Spool storm fix — per-hour file (अनगिनत small files नहीं बनेंगी)
-  6. NSE holidays via OpenAlgo API cache (gap_filler में)
-  7. Idempotent schema (ALTER TABLE IF NOT EXISTS)
+CRITICAL:
+  1. tick_uid: 32-char SHA-256, includes depth+raw content hash, stable
+     float formatting (f"{x:.6f}"), preserves None vs 0 vs ""
+  2. Auto-startup-gap-record: last DB tick से अब तक का gap on first connect
+     → gap_filler Monday-morning bars भर देगा (कोई fake spike नहीं)
+  3. Pool creation retry (DB startup fragility)
+  4. Flusher local buf lock-protected (hang पर recover होता है)
+  5. _parse_timestamp range check ('1.5' → 1970 garbage rokta है)
+
+HIGH:
+  6. record_gap → ON CONFLICT DO NOTHING (replay duplicate safe)
+  7. Watchdog default 60s (low-liquidity false positives)
 """
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ import json
 import logging
 import os
 import queue
+import re
 import signal
 import sys
 import threading
@@ -64,15 +69,14 @@ MODE                = os.getenv("MODE", "quote").lower()
 BATCH_SIZE          = int(os.getenv("BATCH_SIZE", "500"))
 FLUSH_INTERVAL_SEC  = float(os.getenv("FLUSH_INTERVAL_SEC", "1"))
 RECONNECT_MAX_DELAY = int(os.getenv("RECONNECT_MAX_DELAY", "60"))
-WATCHDOG_TIMEOUT    = int(os.getenv("WATCHDOG_TIMEOUT_SEC", "30"))
+WATCHDOG_TIMEOUT    = int(os.getenv("WATCHDOG_TIMEOUT_SEC", "60"))   # v5: 30→60
 SPOOL_DIR           = Path(os.getenv("SPOOL_DIR", "./spool"))
 STORE_RAW_PAYLOAD   = os.getenv("STORE_RAW_PAYLOAD", "false").lower() == "true"
 LOG_LEVEL           = os.getenv("LOG_LEVEL", "INFO").upper()
 
 if MODE not in ("quote", "depth"):
     sys.stderr.write(
-        f"FATAL: MODE='{MODE}' invalid. Allowed: 'quote' or 'depth' "
-        "('both' caused duplicate counting in CAGG — removed in v3+).\n"
+        f"FATAL: MODE='{MODE}' invalid. Allowed: 'quote' or 'depth'.\n"
     )
     sys.exit(2)
 
@@ -82,15 +86,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("collector")
 
-IST = timezone(timedelta(hours=5, minutes=30))
+IST                  = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN          = dtime(9, 15)
 MARKET_CLOSE         = dtime(15, 30)
-# day rollover पर "genuine first volume" cutoff — इसके बाद late-start माना जाएगा
 MARKET_OPEN_GRACE    = dtime(9, 30)
+
+# Sanity: timestamps within 2000-01-01 .. 2100-01-01 unix-sec range
+_TS_MIN_SEC = 946684800
+_TS_MAX_SEC = 4102444800
 
 
 # ---------------------------------------------------------------------------
-# DB SQL — ON CONFLICT DO NOTHING (spool replay duplicate से बचाव)
+# DB SQL — v5: ON CONFLICT (ts, tick_uid) safe replay
 # ---------------------------------------------------------------------------
 INSERT_SQL = """
 INSERT INTO ticks (ts, exchange, symbol, stream_type, ltp, volume, tick_volume,
@@ -102,11 +109,28 @@ ON CONFLICT (ts, tick_uid) DO NOTHING
 """
 
 
+# ---------------------------------------------------------------------------
+# Pool with retry — v5 FIX (Kimi #10): DB startup fragility
+# ---------------------------------------------------------------------------
 def make_pool() -> ConnectionPool:
-    return ConnectionPool(
-        PG_DSN, min_size=1, max_size=4, open=True,
+    pool = ConnectionPool(
+        PG_DSN, min_size=1, max_size=4, open=False,
         kwargs={"autocommit": True},
     )
+    last_err: Exception | None = None
+    for attempt in range(10):
+        try:
+            pool.open(wait=True, timeout=10)
+            log.info("DB pool ready (attempt %d)", attempt + 1)
+            return pool
+        except Exception as e:                                  # noqa: BLE001
+            last_err = e
+            delay = min(30, 2 ** attempt)
+            log.warning("DB pool open fail (attempt %d): %s — retry in %ds",
+                        attempt + 1, e, delay)
+            time.sleep(delay)
+    pool.close()
+    raise RuntimeError(f"DB unreachable after 10 retries: {last_err}")
 
 
 def load_symbols(path: str) -> list[str]:
@@ -131,7 +155,7 @@ def is_market_hours(ts: datetime | None = None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Per-symbol cumulative-volume tracker (day-based rollover + late-start guard)
+# Per-symbol cumulative-volume tracker
 # ---------------------------------------------------------------------------
 _LAST_CUM_VOL:  dict[str, int]  = {}
 _LAST_TICK_DAY: dict[str, date] = {}
@@ -157,27 +181,41 @@ def seed_last_cum_vol(pool: ConnectionPool) -> None:
         log.warning("seed_last_cum_vol failed: %s", e)
 
 
+def get_last_db_tick_ts(pool: ConnectionPool) -> datetime | None:
+    """v5 FIX: startup पर last DB tick का time लाओ → auto gap recording।"""
+    try:
+        with pool.connection() as con, con.cursor() as cur:
+            cur.execute(
+                "SELECT max(ts) FROM ticks WHERE ts >= now() - INTERVAL '7 days'"
+            )
+            row = cur.fetchone()
+        return row[0] if row and row[0] else None
+    except Exception as e:                                      # noqa: BLE001
+        log.warning("get_last_db_tick_ts failed: %s", e)
+        return None
+
+
 def compute_tick_volume(symbol: str, cum_vol: int | None,
                         tick_ts: datetime) -> int | None:
     """
-    Tick की actual quantity (cumulative day-volume का delta) compute करता है।
+    Returns tick की actual quantity (cumulative day-volume का delta)।
 
-    Edge cases handled:
+    Edge cases:
       • Day rollover (tick_day != prev_day):
-          - 9:30 IST से पहले first tick  → return cum_vol (genuine market-open)
-          - 9:30 IST के बाद late start    → return 0 (gap_filler उस slot भरेगा)
-      • Mid-day glitch (cum < prev, same day) → return 0, prev preserve
+          - ≤ 9:30 IST → cum_vol (genuine market-open volume, छोटा spike OK)
+          - > 9:30 IST → 0; auto-startup-gap-record से gap_filler भर देगा
+      • Mid-day glitch (cum < prev) → 0, prev preserve
       • First-ever tick (no prior data):
-          - 9:30 से पहले → return cum_vol
-          - 9:30 के बाद  → return 0
-      • Normal increase → return cum - prev
+          - ≤ 9:30 IST → cum_vol
+          - > 9:30 IST → 0
+      • Normal increase → cum - prev
     """
     if cum_vol is None or cum_vol < 0:
         return None
 
     tick_ist = tick_ts.astimezone(IST)
     tick_day = tick_ist.date()
-    is_market_open_window = tick_ist.time() <= MARKET_OPEN_GRACE
+    in_open_window = tick_ist.time() <= MARKET_OPEN_GRACE
 
     with _VOL_LOCK:
         prev      = _LAST_CUM_VOL.get(symbol)
@@ -187,11 +225,9 @@ def compute_tick_volume(symbol: str, cum_vol: int | None,
         if prev_day is not None and tick_day != prev_day:
             _LAST_CUM_VOL[symbol]  = cum_vol
             _LAST_TICK_DAY[symbol] = tick_day
-            if is_market_open_window:
-                # genuine first-of-day volume
+            if in_open_window:
                 return cum_vol
-            # late start — पूरा morning volume एक tick में मत credit करो
-            log.debug("late-start rollover %s @ %s — return 0",
+            log.debug("rollover late-start %s @ %s — return 0 (gap_filler)",
                       symbol, tick_ist.time())
             return 0
 
@@ -199,13 +235,13 @@ def compute_tick_volume(symbol: str, cum_vol: int | None,
         if prev is not None and cum_vol < prev:
             log.debug("volume glitch %s: cum=%d < prev=%d (same day) — ignore",
                       symbol, cum_vol, prev)
-            return 0   # prev MUST NOT update
+            return 0
 
-        # (3) first-ever tick (no prior data)
+        # (3) first-ever tick
         if prev is None:
             _LAST_CUM_VOL[symbol]  = cum_vol
             _LAST_TICK_DAY[symbol] = tick_day
-            if is_market_open_window:
+            if in_open_window:
                 return cum_vol
             return 0
 
@@ -251,42 +287,35 @@ def _pick(*sources_and_keys) -> Any:
     return None
 
 
+_NUMERIC_TS_RE = re.compile(r"^-?\d+(\.\d+)?$")
+
+
 def _parse_timestamp(ts_raw: Any) -> datetime:
     """
-    String/int/float → tz-aware UTC datetime। Fallbacks:
-      * numeric (int/float OR digit-string like '1717741500000')
-      * ISO 8601, या common Indian formats
-      * naive → IST मानकर UTC
-      * कुछ नहीं तो datetime.now(UTC)
+    String/int/float → tz-aware UTC datetime.
+    v5 FIX: range check (2000-2100) — '1.5' जैसे garbage rokte हैं।
     """
-    # numeric epoch
     if isinstance(ts_raw, (int, float)):
-        ts_val = ts_raw / 1000.0 if ts_raw > 1e12 else ts_raw
-        try:
-            return datetime.fromtimestamp(ts_val, tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return datetime.now(timezone.utc)
+        ts_val = ts_raw / 1000.0 if abs(ts_raw) > 1e12 else float(ts_raw)
+        if _TS_MIN_SEC <= ts_val <= _TS_MAX_SEC:
+            try:
+                return datetime.fromtimestamp(ts_val, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                pass
+        return datetime.now(timezone.utc)
 
     if isinstance(ts_raw, str):
         s = ts_raw.strip()
         if not s:
             return datetime.now(timezone.utc)
 
-        # numeric string ('1717741500000' etc.)
-        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+        # numeric string (strict) — v5 FIX
+        if _NUMERIC_TS_RE.fullmatch(s):
             try:
-                n = int(s)
+                n = float(s)
                 ts_val = n / 1000.0 if abs(n) > 1e12 else n
-                return datetime.fromtimestamp(ts_val, tz=timezone.utc)
-            except (OverflowError, OSError, ValueError):
-                pass
-
-        # float numeric string ('1717741500.123')
-        if any(c.isdigit() for c in s) and "." in s:
-            try:
-                n_f = float(s)
-                ts_val = n_f / 1000.0 if n_f > 1e12 else n_f
-                return datetime.fromtimestamp(ts_val, tz=timezone.utc)
+                if _TS_MIN_SEC <= ts_val <= _TS_MAX_SEC:
+                    return datetime.fromtimestamp(ts_val, tz=timezone.utc)
             except (OverflowError, OSError, ValueError):
                 pass
 
@@ -312,19 +341,51 @@ def _parse_timestamp(ts_raw: Any) -> datetime:
     return datetime.now(timezone.utc)
 
 
+# ---------------------------------------------------------------------------
+# tick_uid — v5 FIX: SHA-256 32-char, depth+raw content, stable formatting,
+#                     None vs 0 distinction
+# ---------------------------------------------------------------------------
+def _norm(v: Any) -> str:
+    """None → '<N>', else repr() — preserves 0 vs None vs '' distinction."""
+    return "<N>" if v is None else repr(v)
+
+
+def _norm_float(v: Any) -> str:
+    if v is None:
+        return "<N>"
+    try:
+        return f"{float(v):.6f}"
+    except (TypeError, ValueError):
+        return "<NAN>"
+
+
+def _hash_jsonb(j: Any) -> str:
+    if j is None:
+        return ""
+    obj = j.obj if isinstance(j, Jsonb) else j
+    try:
+        return hashlib.sha256(
+            json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+    except (TypeError, ValueError):
+        return "<unhashable>"
+
+
 def make_tick_uid(row: dict[str, Any]) -> str:
-    """SHA1(short)-based unique id — same payload का same uid → ON CONFLICT skip."""
     parts = (
         str(row.get("exchange", "")),
         str(row.get("symbol", "")),
         str(row.get("stream_type", "")),
-        row["ts"].isoformat() if isinstance(row.get("ts"), datetime) else str(row.get("ts")),
-        f"{row.get('ltp', '')}",
-        str(row.get("volume") or ""),
-        str(row.get("bid")    or ""),
-        str(row.get("ask")    or ""),
+        row["ts"].isoformat() if isinstance(row.get("ts"), datetime)
+                              else str(row.get("ts")),
+        _norm_float(row.get("ltp")),
+        _norm(row.get("volume")),
+        _norm_float(row.get("bid")),
+        _norm_float(row.get("ask")),
+        _hash_jsonb(row.get("depth")),
+        _hash_jsonb(row.get("raw")),
     )
-    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +473,7 @@ def parse_tick(payload: dict[str, Any], default_exchange: str,
 
 
 # ---------------------------------------------------------------------------
-# Disk spool — per-hour file (storm avoidance)
+# Disk spool — per-hour file
 # ---------------------------------------------------------------------------
 _SPOOL_LOCK = threading.Lock()
 
@@ -475,14 +536,12 @@ def _deserialize_row(d: dict[str, Any]) -> dict[str, Any]:
         out["depth"] = Jsonb(out["depth"])
     if out.get("raw") is not None:
         out["raw"] = Jsonb(out["raw"])
-    # backward compatibility — पुराने v3 spools में tick_uid नहीं था
     if not out.get("tick_uid"):
         out["tick_uid"] = make_tick_uid(out)
     return out
 
 
 def replay_spool(pool: ConnectionPool) -> None:
-    """Tick spool replay (startup पर — concurrent writers नहीं)।"""
     if not SPOOL_DIR.exists():
         return
     files = sorted(SPOOL_DIR.glob("spool_*.jsonl"))
@@ -520,9 +579,12 @@ def replay_gap_spool(pool: ConnectionPool) -> None:
                 started = datetime.fromisoformat(d["started_at"])
                 ended   = datetime.fromisoformat(d["ended_at"])
                 with pool.connection() as con, con.cursor() as cur:
+                    # v5 FIX: ON CONFLICT (started_at, ended_at, reason)
                     cur.execute(
                         "INSERT INTO collector_gaps "
-                        "(started_at, ended_at, reason) VALUES (%s, %s, %s)",
+                        "(started_at, ended_at, reason) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (started_at, ended_at, COALESCE(reason, '')) "
+                        "DO NOTHING",
                         (started, ended, d.get("reason")),
                     )
                 count += 1
@@ -533,7 +595,7 @@ def replay_gap_spool(pool: ConnectionPool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Flusher thread
+# Flusher — v5 FIX: lock-protected local buf (hang पर recover होता है)
 # ---------------------------------------------------------------------------
 class Flusher(threading.Thread):
     def __init__(self, q: queue.Queue, pool: ConnectionPool,
@@ -541,26 +603,46 @@ class Flusher(threading.Thread):
         super().__init__(daemon=True, name="flusher")
         self.q, self.pool, self.stop_evt = q, pool, stop_evt
         self.last_flush_ts = time.monotonic()
+        self.buf: list[dict[str, Any]] = []
+        self.buf_lock = threading.Lock()
 
     def run(self) -> None:
-        buf: list[dict[str, Any]] = []
-        while not self.stop_evt.is_set() or not self.q.empty() or buf:
+        while True:
+            done = self.stop_evt.is_set()
+            if done and self.q.empty() and not self._buf_count():
+                break
             try:
-                buf.append(self.q.get(timeout=0.2))
+                item = self.q.get(timeout=0.2)
+                with self.buf_lock:
+                    self.buf.append(item)
             except queue.Empty:
                 pass
 
             now = time.monotonic()
+            with self.buf_lock:
+                buf_len = len(self.buf)
             should_flush = (
-                len(buf) >= BATCH_SIZE
-                or (buf and now - self.last_flush_ts >= FLUSH_INTERVAL_SEC)
-                or (self.stop_evt.is_set() and buf)
+                buf_len >= BATCH_SIZE
+                or (buf_len > 0 and now - self.last_flush_ts >= FLUSH_INTERVAL_SEC)
+                or (done and buf_len > 0)
             )
             if should_flush:
-                self._flush(buf)
-                buf.clear()
+                with self.buf_lock:
+                    rows = self.buf
+                    self.buf = []
+                self._flush(rows)
                 self.last_flush_ts = now
         log.info("flusher stopped")
+
+    def _buf_count(self) -> int:
+        with self.buf_lock:
+            return len(self.buf)
+
+    def take_buffer_snapshot(self) -> list[dict[str, Any]]:
+        with self.buf_lock:
+            snap = self.buf
+            self.buf = []
+        return snap
 
     def _flush(self, rows: list[dict[str, Any]]) -> None:
         try:
@@ -576,7 +658,7 @@ class Flusher(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
-# Gap recorder — fail पर gap_spool में जाता है
+# Gap recorder — v5 FIX: ON CONFLICT DO NOTHING
 # ---------------------------------------------------------------------------
 def record_gap(pool: ConnectionPool, started: datetime,
                ended: datetime, reason: str) -> None:
@@ -584,7 +666,9 @@ def record_gap(pool: ConnectionPool, started: datetime,
         with pool.connection() as con, con.cursor() as cur:
             cur.execute(
                 "INSERT INTO collector_gaps (started_at, ended_at, reason) "
-                "VALUES (%s, %s, %s)",
+                "VALUES (%s, %s, %s) "
+                "ON CONFLICT (started_at, ended_at, COALESCE(reason, '')) "
+                "DO NOTHING",
                 (started, ended, reason),
             )
         log.warning("gap recorded: %s -> %s (%s)", started, ended, reason)
@@ -609,10 +693,15 @@ def run() -> None:
     instruments = [{"exchange": EXCHANGE, "symbol": s} for s in symbols]
 
     pool = make_pool()
-    # Order: gap_spool replay → tick_spool replay → seed cumulative volumes
     replay_gap_spool(pool)
     replay_spool(pool)
     seed_last_cum_vol(pool)
+
+    # v5 FIX: auto-startup-gap recording
+    last_disconnect_at: datetime | None = get_last_db_tick_ts(pool)
+    if last_disconnect_at:
+        log.info("startup: last DB tick %s — gap will be recorded on first connect",
+                 last_disconnect_at)
 
     tick_q: queue.Queue = queue.Queue(maxsize=200_000)
     stop_evt = threading.Event()
@@ -657,8 +746,6 @@ def run() -> None:
         reraise=True,
     )
 
-    last_disconnect_at: datetime | None = None
-
     for attempt in retry_iter:
         with attempt:
             if stop_evt.is_set():
@@ -683,7 +770,9 @@ def run() -> None:
 
             now_utc = datetime.now(timezone.utc)
             if last_disconnect_at and (now_utc - last_disconnect_at).total_seconds() > 5:
-                record_gap(pool, last_disconnect_at, now_utc, "ws_reconnect")
+                reason = ("startup_gap" if last_disconnect_at < connected_at - timedelta(minutes=5)
+                          else "ws_reconnect")
+                record_gap(pool, last_disconnect_at, now_utc, reason)
             last_disconnect_at = None
 
             try:
@@ -728,19 +817,24 @@ def run() -> None:
     log.info("waiting for flusher (%d ticks pending)", tick_q.qsize())
     flusher.join(timeout=60)
     if flusher.is_alive():
-        remaining: list[dict[str, Any]] = []
+        # v5 FIX: drain BOTH flusher's local buf AND queue
+        flusher_buf = flusher.take_buffer_snapshot()
+        queue_remaining: list[dict[str, Any]] = []
         while True:
             try:
-                remaining.append(tick_q.get_nowait())
+                queue_remaining.append(tick_q.get_nowait())
             except queue.Empty:
                 break
-        if remaining:
-            log.error("flusher hang — spooling %d remaining ticks", len(remaining))
+        all_remaining = flusher_buf + queue_remaining
+        if all_remaining:
+            log.error("flusher hang — spooling %d remaining ticks "
+                      "(buf=%d, queue=%d)",
+                      len(all_remaining), len(flusher_buf), len(queue_remaining))
             try:
-                _spool_rows(remaining)
+                _spool_rows(all_remaining)
             except Exception as e:                               # noqa: BLE001
                 log.critical("final spool fail: %s — %d rows lost",
-                             e, len(remaining))
+                             e, len(all_remaining))
 
     pool.close()
     log.info("bye")

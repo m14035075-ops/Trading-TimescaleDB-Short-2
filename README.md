@@ -1,60 +1,57 @@
-# NSE Tick Collector — Hindi गाइड (v4)
+# NSE Tick Collector — Hindi गाइड (v5)
 
 > 50 भारतीय शेयरों का **live tick data** OpenAlgo WebSocket से उठाकर अपने ही
 > server के **TimescaleDB** में store करने वाला production-grade project।
-> v4 में ChatGPT + Gemini के **3 rounds का review** लागू है — कुल **37+ bugs fix**।
+> v5 में ChatGPT + Gemini + Qwen + Kimi के **4 rounds का review** लागू है —
+> कुल **57+ bugs fix**।
 
 ---
 
-## v1 → v2 → v3 → v4 का सफर
+## v1 → v2 → v3 → v4 → v5 का सफर
 
-- **v2 round-1 (12 fixes):** watchdog placement, parse_tick nested data,
-  tick_volume delta, disk spool, gap_filler retry, IST timezone, schema gaps,
-  v_quotes view, MODE=depth, .env comments, make_conninfo, index।
-- **v3 round-2 (15 fixes):** watchdog grace + state reset, naive timestamp →
-  IST, day-rollover detection, depth bids/asks arrays, MODE=both reject,
-  spool replay order, queue.Full→spool, flusher hang spool, realtime CAGG,
-  pool open=True, partial-minute floor, market-hours overlap check,
-  day-by-day chunking, quality column, .env multi-line।
+- **v2 (round-1: 12 fixes):** watchdog placement, parse_tick nested data,
+  tick_volume delta, disk spool, gap_filler retry, IST timezone
+- **v3 (round-2: 15 fixes):** watchdog grace, naive timestamp, day-rollover,
+  depth arrays, MODE=both reject, partial-minute floor, etc.
+- **v4 (round-3: 10 fixes):** ALTER migration, late-start guard, tick_uid,
+  numeric string ts, gap_spool, holiday API
+- **v5 (round-4: 20 fixes):** **see below**
 
-### v4 round-3 (10 critical production fixes)
+### v5 round-4 fixes (20 critical issues)
 
-| # | Bug                                                                       | Fix |
-|---|---------------------------------------------------------------------------|-----|
-| 1 | DB migration पुराने schema पर new columns add नहीं करता                  | Idempotent `ALTER TABLE ADD COLUMN IF NOT EXISTS` + migration notes |
-| 2 | **Day-rollover late-start spike** — 10:30 AM start पर पूरा morning vol एक tick में | tick का IST time check; ≤9:30 → genuine, >9:30 → return 0 (gap_filler भरेगा) |
-| 3 | **Spool replay duplicate** — crash between insert & unlink → next start पर double | `tick_uid` (SHA1 hash) + UNIQUE index + `ON CONFLICT DO NOTHING` |
-| 4 | **Numeric string timestamp** miss — `"1717741500000"` → `datetime.now()` (wrong!) | `s.isdigit()` check before format parsing |
-| 5 | `record_gap()` fail पर gap permanently lost (DB down + WS disconnect)    | Gap-spool JSONL + startup replay |
-| 6 | Spool storm — हर queue-full tick के लिए नई file                          | Per-hour append-only file (`spool_YYYYMMDD_HH.jsonl`) |
-| 7 | `gap_overlaps_market_hours` doesn't know NSE holidays                     | `client.holidays()` API cache; weekday-only fallback |
-| 8 | `v_quotes_1m` partial+history same minute → duplicate                     | `v_quotes_1m_raw` (forensic) + `v_quotes_1m` (DISTINCT ON, quality priority) |
-| 9 | `sec_count >= 50` low-liquidity stocks में हमेशा partial                  | Gap-overlap-based quality (`full`/`partial`/`sparse`/`history`) |
-| 10 | `ohlc_1s` mixed stream_types — forensic clarity                           | Comment + `stream_type` column persists |
+| # | Bug                                                                    | Fix |
+|---|------------------------------------------------------------------------|-----|
+| 1 | `tick_uid` hash incomplete — depth/raw missing, unstable float, 0/None collapse | 32-char SHA-256 + content hash for depth/raw + `_norm()` (None vs 0) + `f"{x:.6f}"` |
+| 2 | **Monday-restart volume loss** — day rollover after 9:30 lost data    | Auto-startup-gap recording: last DB tick से अब तक का gap on first connect |
+| 3 | `collector_gaps` no UNIQUE → spool replay duplicates                   | UNIQUE(started_at, ended_at, COALESCE(reason,'')) + ON CONFLICT DO NOTHING |
+| 4 | `gap_minutes` SQL last-partial-minute miss                             | `time_bucket` floor on BOTH ends of generate_series |
+| 5 | `v_quotes_1m_raw` history filter missing (always included)             | `WHERE lm.ts IS NULL OR gm.ts IS NOT NULL` |
+| 6 | Quality priority wrong (`full > history > sparse > partial`)            | New: `full > sparse > history > partial` (live real > history fill) |
+| 7 | `--today` IST timezone bug (UTC truncation)                            | `(now() AT TIME ZONE 'Asia/Kolkata')::date AT TIME ZONE 'Asia/Kolkata'` |
+| 8 | `df_rows_in_window` crashes on list/dict response                      | Defensive: convert to DataFrame; handle `to_pydatetime`/string/datetime |
+| 9 | NSE holidays parsing fragile (settlement holidays counted, date format breaks) | `closed_exchanges`/`holiday_type` filter + multi-format parser + dynamic year range |
+| 10 | Multi-day partial gap success                                          | `failed_days` tracking; failure ONLY on API errors |
+| 11 | SQL injection pattern in gap_filler                                    | `psycopg.sql` composition |
+| 12 | `_parse_timestamp` matches non-timestamps ("1.5" → 1970)               | Strict regex + range check (2000-2100) |
+| 13 | Pool startup fragility (DB down at startup = crash)                    | Retry loop with exponential backoff (10 attempts) |
+| 14 | Flusher buffer loss on hang                                            | Lock-protected `buf` + `take_buffer_snapshot()` on shutdown |
+| 15 | `requirements.txt` missing pandas, version mismatch                    | `pandas>=2.0.0`, `psycopg-pool>=3.2` |
+| 16 | `.env.example` v3 header                                               | v5 |
+| 17 | Watchdog 30s false positives in low liquidity                          | Default 60s |
+| 18 | `fill_one_gap` over-strict (15:25-15:35 false-fail)                    | Failure only on API errors, not 0-rows |
+| 19 | Holiday cache static years                                             | Dynamic from gap dates |
+| 20 | Tick_uid 16-char (~10 days at scale possibly)                          | 32 chars (128-bit safe for billions) |
 
 ---
 
-## आपके सवालों के जवाब
+## आपके सवालों के जवाब (एक नज़र)
 
-### क्या script से अपने server के TimescaleDB में data रख सकते हैं?
-**हाँ — यही standard तरीक़ा है।** broker → WS → script → TimescaleDB।
-
-### OpenAlgo से जाएँ या सीधा broker से?
-| बात                    | सीधा broker SDK | OpenAlgo |
-|------------------------|----------------|----------|
-| Latency (localhost)    | ~0 ms          | ~1-2 ms  |
-| 30+ brokers code reuse | ❌            | ✅       |
-| Symbol format unified  | ❌            | ✅       |
-
-> दोनों एक ही server पर — फ़र्क़ practically zero। **OpenAlgo recommended।**
-
-### Connection कटा — data कैसे recover होगा? (4 परतें)
+### Connection कटा — data कैसे recover होगा? (5 परतें)
 1. **Auto-reconnect** — tenacity exponential backoff (1s → 60s)
-2. **Watchdog** — silent disconnect detection (30s tickless = reconnect)
-3. **Disk spool** — DB down = JSONL file (per-hour); startup auto-replay; `tick_uid` ON CONFLICT से safe
-4. **Gap fill** — `collector_gaps` log; `gap_filler.py` 1-min bars history API से, **NSE-holiday aware**, day-by-day chunking
-
-> **Note:** brokers का "true 1-second history" मुफ़्त नहीं मिलता।
+2. **Watchdog** — silent disconnect detection (60s tickless = reconnect)
+3. **Disk spool** — DB down = JSONL per-hour file; startup auto-replay; `tick_uid` ON CONFLICT safe
+4. **Gap fill** — `collector_gaps` log + UNIQUE constraint; `gap_filler.py` 1-min bars from history (NSE-holiday aware, day-by-day chunked, partial-failure tracked)
+5. **Auto-startup-gap** (v5 NEW) — restart पर `last DB tick → now` gap automatic record होती है, gap_filler morning bars भर देगा
 
 ---
 
@@ -68,44 +65,39 @@
                                                         ▼
                                           ┌─────────────────────┐
                                           │ Flusher (batch)     │
-                                          │   ↓ DB OK           │
-                                          │   ↓ DB FAIL → spool │  (per-hour file)
-                                          │   ↓ Q FULL  → spool │
+                                          │  with lock-protected│
+                                          │  buf for hang safety│
                                           └──────────┬──────────┘
                                                      ▼
                                           ┌─────────────────────┐
                                           │   TimescaleDB       │
-                                          │   ─ ticks (raw)     │  +tick_uid UNIQUE
+                                          │   ─ ticks (tick_uid)│
                                           │   ─ ohlc_1s (CAGG)  │
                                           │   ─ ohlc_1m_filled  │
-                                          │   ─ collector_gaps  │
-                                          │   ─ v_quotes_1m_raw │  (forensic)
-                                          │   ─ v_quotes_1m     │  (clean ML feed)
+                                          │   ─ collector_gaps  │  UNIQUE
+                                          │   ─ v_quotes_1m_raw │
+                                          │   ─ v_quotes_1m     │  full > sparse > history > partial
                                           └─────────────────────┘
 ```
 
-**Volume delta logic (v4):**
+**Volume delta logic (v5):**
 ```
-parse_tick → compute_tick_volume(symbol, cum_vol, ts):
-   • day rollover (tick_day != prev_day):
-       - tick_time ≤ 9:30 IST → cum_vol (genuine first-of-day volume)
-       - tick_time > 9:30 IST → 0 (late start; gap_filler भरेगा)
-   • intra-day decrease (cum < prev) → 0 (broker glitch, prev preserve)
-   • normal increase → cum-prev
-   • first ever tick:
-       - ≤ 9:30 IST → cum_vol
-       - > 9:30 IST → 0
+compute_tick_volume:
+   day rollover (tick_day != prev_day):
+       ≤ 9:30 IST → cum_vol (genuine market-open volume)
+       > 9:30 IST → 0 (auto-startup-gap covers it via gap_filler)
+   intra-day decrease → 0 (broker glitch, prev preserve)
+   normal → cum-prev
 ```
 
-**Spool flow (v4):**
+**Auto-startup-gap (v5 NEW):**
 ```
-DB fail | Q full | Flusher hang →  spool/spool_YYYYMMDD_HH.jsonl  (append)
-record_gap fail                  →  spool/gapspool_YYYYMMDD_HH.jsonl
-                                                 ↓
-                                  Startup replay (chronological)
-                                                 ↓
-                                  ON CONFLICT (ts, tick_uid) DO NOTHING
-                                  → safe even if crash between insert+unlink
+collector startup:
+   last_db_ts = max(ts in ticks WHERE ts >= 7 days ago)
+   last_disconnect_at = last_db_ts
+   on first connect:
+       record_gap(last_disconnect_at, now, "startup_gap")
+   gap_filler --today fills these morning bars from history API
 ```
 
 ---
@@ -115,7 +107,6 @@ record_gap fail                  →  spool/gapspool_YYYYMMDD_HH.jsonl
 ### 1. TimescaleDB
 ```bash
 sudo apt install postgresql-16
-# TimescaleDB repo से timescaledb-2-postgresql-16
 sudo timescaledb-tune --quiet --yes
 sudo systemctl restart postgresql
 ```
@@ -130,20 +121,16 @@ SQL
 psql -h 127.0.0.1 -U marketdata -d marketdata -f schema.sql
 ```
 
-> **पुराने (v2/v3) DB से upgrade?** schema.sql चलाने से पहले एक बार:
+> **पुराने (v2/v3/v4) DB से upgrade?** सिर्फ़ views drop करें (CAGG को नहीं!):
 > ```sql
-> DROP MATERIALIZED VIEW IF EXISTS ohlc_1s CASCADE;
 > DROP VIEW IF EXISTS v_quotes_1m, v_quotes_1m_raw;
 > ```
 > फिर `psql -f schema.sql` — ALTER TABLE से नए columns idempotent जुड़ेंगे।
 
-### 3. OpenAlgo
-[docs.openalgo.in](https://docs.openalgo.in/) से install + broker login + API key।
-
-### 4. Python env
+### 3. OpenAlgo + Python env
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
+# OpenAlgo install से अपने broker से login + API key copy
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env       # API key + password भरें
 ```
@@ -156,27 +143,24 @@ cp .env.example .env       # API key + password भरें
 # सुबह 9 बजे
 python collector.py
 
-# शाम — gap fill (NSE holidays auto-skip करेगा)
+# शाम — gap fill (NSE holidays auto-skip; day-by-day chunking)
 python gap_filler.py --today
 
 # कुछ symbols fail हुए तो retry
 python gap_filler.py --retry
 ```
 
-### Level-2 (order book) चाहिए?
-`.env` में `MODE=depth`। `depth` column में पूरा order book JSONB।
+### Level-2 (order book)
+`.env` में `MODE=depth`। `depth` JSONB column में पूरा order book।
 
 ```sql
--- Order Book Imbalance example
 SELECT
     ts, symbol,
     (depth -> 'bids' -> 0 ->> 'price')::FLOAT      AS bid_price,
     (depth -> 'bids' -> 0 ->> 'quantity')::INT     AS bid_qty,
     (depth -> 'asks' -> 0 ->> 'price')::FLOAT      AS ask_price,
     (depth -> 'asks' -> 0 ->> 'quantity')::INT     AS ask_qty
-FROM ticks
-WHERE  stream_type = 'depth' AND depth IS NOT NULL
-ORDER  BY ts DESC LIMIT 10;
+FROM ticks WHERE depth IS NOT NULL ORDER BY ts DESC LIMIT 10;
 ```
 
 ---
@@ -184,19 +168,18 @@ ORDER  BY ts DESC LIMIT 10;
 ## ML Training Quick Reference
 
 ```sql
--- Strict ML training feed (recommended)
+-- Strict ML feed (recommended) — full live OR history fill
 SELECT * FROM v_quotes_1m
-WHERE  symbol = 'INFY'
-  AND  ts BETWEEN '2026-01-01' AND '2026-06-07'
+WHERE  symbol = 'INFY' AND ts >= '2026-01-01'
   AND  quality IN ('full', 'history')
 ORDER  BY ts;
 
--- Low-liquidity stocks include करना है
+-- Low-liquidity stocks include
 SELECT * FROM v_quotes_1m
-WHERE  quality != 'partial'   -- sparse भी OK अगर gap नहीं था
+WHERE  quality != 'partial'   -- sparse OK अगर gap नहीं था
 ORDER  BY ts;
 
--- Volume sanity check (mid-day glitch detection)
+-- Volume sanity check
 SELECT symbol, count(*) AS suspicious_zeros
 FROM   ticks
 WHERE  ts > date_trunc('day', now())
@@ -204,8 +187,8 @@ WHERE  ts > date_trunc('day', now())
 GROUP  BY symbol HAVING count(*) > 100;
 
 -- Gap forensics
-SELECT id, started_at, ended_at, attempts,
-       array_length(failed_symbols, 1) AS n_fail, last_error
+SELECT id, started_at, ended_at, attempts, reason,
+       array_length(failed_symbols, 1) AS n_fail
 FROM   collector_gaps WHERE filled = FALSE;
 ```
 
@@ -239,26 +222,12 @@ sudo systemctl enable --now tick-collector
 journalctl -u tick-collector -f
 ```
 
-OpenAlgo को भी अपनी systemd service बनाएँ ताकि वह crash होने पर auto-restart हो।
-
 Cron (शाम 4 बजे gap fill):
 ```cron
-0 16 * * 1-5 /home/marketdata/Trading-TimescaleDB-Short-2/.venv/bin/python /home/marketdata/Trading-TimescaleDB-Short-2/gap_filler.py >> /var/log/gap_filler.log 2>&1
+0 16 * * 1-5 /home/marketdata/Trading-TimescaleDB-Short-2/.venv/bin/python /home/marketdata/Trading-TimescaleDB-Short-2/gap_filler.py --today >> /var/log/gap_filler.log 2>&1
 ```
 
----
-
-## Tuning
-
-| problem                   | solution |
-|---------------------------|----------|
-| Insert lag                | `BATCH_SIZE` 1000-2000, `FLUSH_INTERVAL_SEC=0.5` |
-| Disk fast भर रहा          | `STORE_RAW_PAYLOAD=false` (default), compression policy active |
-| बहुत पुराना data नहीं चाहिए| `schema.sql` में retention policy uncomment |
-| 50+ symbols               | OpenAlgo हज़ारों handle करता है |
-| Watchdog बहुत agressive   | `WATCHDOG_TIMEOUT_SEC=60` |
-| Spool भरा हुआ है          | `ls spool/` — startup पर खुद drain होगा |
-| Holidays auto-skip नहीं   | OpenAlgo `holidays()` API check; manually `failed_symbols` cleanup |
+OpenAlgo को भी अपनी systemd service बनाएँ ताकि वह crash होने पर auto-restart हो।
 
 ---
 
@@ -266,18 +235,19 @@ Cron (शाम 4 बजे gap fill):
 
 ```
 Trading-TimescaleDB-Short-2/
-├── schema.sql          TimescaleDB schema (v4) + tick_uid UNIQUE + smart views
-├── collector.py        Day-rollover late-start guard, gap-spool, per-hour spool
-├── gap_filler.py       NSE holidays + day chunking + market-hours validation
+├── schema.sql          v5: tick_uid UNIQUE, gaps UNIQUE, smart views with quality
+├── collector.py        v5: 32-char SHA-256 uid, auto-startup-gap, pool retry,
+│                            flusher buf protection, _parse_timestamp range check
+├── gap_filler.py       v5: psycopg.sql composition, IST --today, dataframe defensive,
+│                            failed_days tracking, holiday closed_exchanges check
 ├── symbols.txt         Nifty 50 default
-├── requirements.txt
+├── requirements.txt    + pandas
 ├── .env.example
 ├── .gitignore
-├── README.md
+├── README.md           यह file
 └── REVIEW_BUNDLE.md    Single-file bundle for AI review
 ```
 
-बस — market hours में `collector.py` चलाते रहें; production-grade 1-sec tick data
-रोज़ का साफ़-सुथरा इकट्ठा होता रहेगा।
+> **Status:** v5 — **57+ review issues fixed across 4 rounds**। Production-deploy ready।
 
-> **Status:** v4 अब **production-deploy ready**। 27 + 10 = **37 review issues fixed**।
+बस — market hours में `collector.py` चलाते रहें; production-grade tick data रोज़ का इकट्ठा होता रहेगा।
