@@ -238,8 +238,15 @@ def compute_tick_volume(symbol: str, cum_vol: int | None,
           - ≤ 9:30 IST → cum_vol
           - > 9:30 IST → 0
       • Normal increase → cum - prev
+
+    v9 SELF-AUDIT FIX (CRITICAL): cum_vol=None ticks (volumeless updates)
+    पर भी _LAST_TICK_TS update करते हैं, ताकि बाद के ticks पर reconnect
+    detection गलत trigger न हो (stream अभी भी live था)।
     """
     if cum_vol is None or cum_vol < 0:
+        # v9: liveness track करो — broker कभी-कभी volume-less LTP updates भेजता है
+        with _VOL_LOCK:
+            _LAST_TICK_TS[symbol] = tick_ts
         return None
 
     tick_ist = tick_ts.astimezone(IST)
@@ -263,11 +270,11 @@ def compute_tick_volume(symbol: str, cum_vol: int | None,
         # (2) mid-day glitch
         if prev is not None and cum_vol < prev:
             log.debug("volume glitch %s: cum=%d < prev=%d", symbol, cum_vol, prev)
+            # v9: glitch पर भी _LAST_TICK_TS refresh (stream live है)
+            _LAST_TICK_TS[symbol] = tick_ts
             return 0
 
         # (2b) v7 FIX (ChatGPT #2): same-day reconnect detection
-        # बड़ा time-gap = WS reconnect; cumulative delta को एक tick में
-        # credit नहीं करते (gap_filler उसे history bars से भरेगा)।
         if prev_ts is not None:
             gap_sec = (tick_ts - prev_ts).total_seconds()
             if gap_sec > RECONNECT_GAP_SEC:
@@ -472,6 +479,15 @@ def parse_tick(payload: dict[str, Any], default_exchange: str,
         if ltp is None:
             return None
 
+        # v9 SELF-AUDIT: NaN/Inf LTP को CAGG-pollution से रोको
+        try:
+            ltp_f = float(ltp)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(ltp_f):
+            log.debug("non-finite LTP for %s: %r — drop tick", symbol, ltp)
+            return None
+
         ts_raw = _pick(payload, inner, "timestamp", "exchange_timestamp",
                        "ltt", "last_traded_time")
         ts = _parse_timestamp(ts_raw)
@@ -514,7 +530,7 @@ def parse_tick(payload: dict[str, Any], default_exchange: str,
             "exchange":    exchange,
             "symbol":      symbol,
             "stream_type": kind,
-            "ltp":         float(ltp),
+            "ltp":         ltp_f,
             "volume":      cum_vol,
             "tick_volume": tick_volume,
             "bid":         bid_val,

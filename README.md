@@ -1,12 +1,21 @@
-# NSE Tick Collector — Hindi गाइड (v8)
+# NSE Tick Collector — Hindi गाइड (v9)
 
 > 50 भारतीय शेयरों का **live tick data** OpenAlgo WebSocket से उठाकर अपने ही
 > server के **TimescaleDB** में store करने वाला production-grade project।
-> v8 = 6 review rounds + **self-audit** के total **78 fixes**।
+> v9 = 6 review rounds + **2 rounds of self-audit** = total **80 fixes**।
 
 ---
 
-## v8 self-audit fixes (मैं ने खुद मिले 2 bugs)
+## v9 self-audit fixes (round-2 self-recheck — 2 critical bugs)
+
+| # | Bug                                                               | Severity | Fix |
+|---|-------------------------------------------------------------------|----------|-----|
+| 1 | **`compute_tick_volume` early-return पर `_LAST_TICK_TS` update नहीं** — volumeless ticks (LTP-only updates) के बाद real tick पर false reconnect detection trigger → tick_volume=0, volume permanently lost | 🔴 CRITICAL | Early-return से पहले `_LAST_TICK_TS` update; mid-day glitch branch में भी refresh |
+| 2 | **NaN/Inf LTP CAGG pollution** — `float("nan")` `parse_tick` से pass through → SQL `max/min/first/last` NaN propagate | 🟡 MEDIUM | `math.isfinite(ltp_f)` check, return None on non-finite |
+
+---
+
+## v8 self-audit fixes (round-1 self-recheck — 2 bugs)
 
 | # | Bug                                                               | Severity | Fix |
 |---|-------------------------------------------------------------------|----------|-----|

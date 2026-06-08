@@ -1,27 +1,16 @@
-# NSE Tick Collector — Full Code Review Bundle (v8 — self-audit)
+# NSE Tick Collector — Full Code Review Bundle (v9 — 2nd self-audit)
 
-> **For ChatGPT / Gemini / Claude / Qwen / Kimi reviewers:**
-> v8 = 6 review rounds + my own self-audit = **78 review issues fixed**।
+> v9 = 6 reviewer rounds + 2 self-audit rounds = **80 issues fixed**
 >
-> **v8 self-audit के 2 fixes:**
-> - **CRITICAL:** `_LAST_TICK_TS` collector-startup पर seed नहीं हो रहा था — v7
->   का reconnect-spike fix collector-restart scenario पर bypass हो जाता था।
->   अब `seed_last_cum_vol` में जोड़ा।
-> - **MEDIUM:** `gap_overlaps_market_hours()` dead code था (v6 में disconnect
->   हुआ); अब `fill_one_gap` में revived — market-hours में 0-rows = failure
->   (Nifty 50 stocks पर broker symbol/timestamp mismatch अब detect होगा)।
->
-> **Verify:**
-> 1. seed_last_cum_vol अब `_LAST_TICK_TS` भी set करता है — collector-restart
->    के बाद first tick पर reconnect detection actually fire करेगा?
-> 2. fill_one_gap का strict mode — illiquid Nifty-50 edge cases?
-> 3. Mid-day reconnect within 60s threshold — false negative possible?
+> v9 self-audit (round-2) के 2 fixes:
+> 1. CRITICAL: cum_vol=None ticks पर _LAST_TICK_TS update — false reconnect rokta है
+> 2. MEDIUM: NaN/Inf LTP CAGG pollution rokta है (math.isfinite check)
 
 ---
 
-## File 1 of 8 — \`schema.sql\`
+## File 1 — `schema.sql`
 
-\`\`\`sql
+```sql
 -- =====================================================================
 -- NSE Tick Collector — TimescaleDB Schema  (v5 — round-4 review fixes)
 -- =====================================================================
@@ -245,9 +234,7 @@ ORDER  BY ts, exchange, symbol,
     END;
 ```
 
----
-
-## File 2 of 8 — `collector.py`  (908 lines)
+## File 2 — `collector.py` (924 lines)
 
 ```python
 """
@@ -490,8 +477,15 @@ def compute_tick_volume(symbol: str, cum_vol: int | None,
           - ≤ 9:30 IST → cum_vol
           - > 9:30 IST → 0
       • Normal increase → cum - prev
+
+    v9 SELF-AUDIT FIX (CRITICAL): cum_vol=None ticks (volumeless updates)
+    पर भी _LAST_TICK_TS update करते हैं, ताकि बाद के ticks पर reconnect
+    detection गलत trigger न हो (stream अभी भी live था)।
     """
     if cum_vol is None or cum_vol < 0:
+        # v9: liveness track करो — broker कभी-कभी volume-less LTP updates भेजता है
+        with _VOL_LOCK:
+            _LAST_TICK_TS[symbol] = tick_ts
         return None
 
     tick_ist = tick_ts.astimezone(IST)
@@ -515,11 +509,11 @@ def compute_tick_volume(symbol: str, cum_vol: int | None,
         # (2) mid-day glitch
         if prev is not None and cum_vol < prev:
             log.debug("volume glitch %s: cum=%d < prev=%d", symbol, cum_vol, prev)
+            # v9: glitch पर भी _LAST_TICK_TS refresh (stream live है)
+            _LAST_TICK_TS[symbol] = tick_ts
             return 0
 
         # (2b) v7 FIX (ChatGPT #2): same-day reconnect detection
-        # बड़ा time-gap = WS reconnect; cumulative delta को एक tick में
-        # credit नहीं करते (gap_filler उसे history bars से भरेगा)।
         if prev_ts is not None:
             gap_sec = (tick_ts - prev_ts).total_seconds()
             if gap_sec > RECONNECT_GAP_SEC:
@@ -724,6 +718,15 @@ def parse_tick(payload: dict[str, Any], default_exchange: str,
         if ltp is None:
             return None
 
+        # v9 SELF-AUDIT: NaN/Inf LTP को CAGG-pollution से रोको
+        try:
+            ltp_f = float(ltp)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(ltp_f):
+            log.debug("non-finite LTP for %s: %r — drop tick", symbol, ltp)
+            return None
+
         ts_raw = _pick(payload, inner, "timestamp", "exchange_timestamp",
                        "ltt", "last_traded_time")
         ts = _parse_timestamp(ts_raw)
@@ -766,7 +769,7 @@ def parse_tick(payload: dict[str, Any], default_exchange: str,
             "exchange":    exchange,
             "symbol":      symbol,
             "stream_type": kind,
-            "ltp":         float(ltp),
+            "ltp":         ltp_f,
             "volume":      cum_vol,
             "tick_volume": tick_volume,
             "bid":         bid_val,
@@ -1160,9 +1163,7 @@ if __name__ == "__main__":
     run()
 ```
 
----
-
-## File 3 of 8 — `gap_filler.py`  (517 lines)
+## File 3 — `gap_filler.py` (517 lines)
 
 ```python
 """
@@ -1684,8 +1685,6 @@ if __name__ == "__main__":
     main()
 ```
 
----
-
 ## File: `requirements.txt`
 
 ```
@@ -1695,8 +1694,6 @@ python-dotenv>=1.0.0
 tenacity>=8.2.0
 pandas>=2.0.0
 ```
-
----
 
 ## File: `.env.example`
 
@@ -1747,8 +1744,6 @@ STORE_RAW_PAYLOAD=false
 
 LOG_LEVEL=INFO
 ```
-
----
 
 ## File: `symbols.txt`
 
@@ -1807,8 +1802,6 @@ BAJAJ-AUTO
 SHRIRAMFIN
 ```
 
----
-
 ## File: `.gitignore`
 
 ```
@@ -1819,20 +1812,27 @@ __pycache__/
 *.log
 ```
 
----
-
 ## File: `README.md`
 
 ````markdown
-# NSE Tick Collector — Hindi गाइड (v8)
+# NSE Tick Collector — Hindi गाइड (v9)
 
 > 50 भारतीय शेयरों का **live tick data** OpenAlgo WebSocket से उठाकर अपने ही
 > server के **TimescaleDB** में store करने वाला production-grade project।
-> v8 = 6 review rounds + **self-audit** के total **78 fixes**।
+> v9 = 6 review rounds + **2 rounds of self-audit** = total **80 fixes**।
 
 ---
 
-## v8 self-audit fixes (मैं ने खुद मिले 2 bugs)
+## v9 self-audit fixes (round-2 self-recheck — 2 critical bugs)
+
+| # | Bug                                                               | Severity | Fix |
+|---|-------------------------------------------------------------------|----------|-----|
+| 1 | **`compute_tick_volume` early-return पर `_LAST_TICK_TS` update नहीं** — volumeless ticks (LTP-only updates) के बाद real tick पर false reconnect detection trigger → tick_volume=0, volume permanently lost | 🔴 CRITICAL | Early-return से पहले `_LAST_TICK_TS` update; mid-day glitch branch में भी refresh |
+| 2 | **NaN/Inf LTP CAGG pollution** — `float("nan")` `parse_tick` से pass through → SQL `max/min/first/last` NaN propagate | 🟡 MEDIUM | `math.isfinite(ltp_f)` check, return None on non-finite |
+
+---
+
+## v8 self-audit fixes (round-1 self-recheck — 2 bugs)
 
 | # | Bug                                                               | Severity | Fix |
 |---|-------------------------------------------------------------------|----------|-----|
@@ -2086,4 +2086,4 @@ Trading-TimescaleDB-Short-2/
 बस — market hours में `collector.py` चलाते रहें; production-grade tick data रोज़ का इकट्ठा होता रहेगा।
 ````
 
-## End of bundle — Total: 2013 lines.
+## End — Total: 2038 lines.
