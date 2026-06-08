@@ -1,34 +1,34 @@
-# NSE Tick Collector — Hindi गाइड (v6)
+# NSE Tick Collector — Hindi गाइड (v7)
 
 > 50 भारतीय शेयरों का **live tick data** OpenAlgo WebSocket से उठाकर अपने ही
 > server के **TimescaleDB** में store करने वाला production-grade project।
-> v6 में ChatGPT + Gemini + Qwen + Kimi के **5 rounds का review** लागू है —
-> कुल **67+ bugs fix**।
+> v7 में ChatGPT + Gemini + Qwen + Kimi के **6 rounds का review** लागू है —
+> कुल **76+ bugs fix**।
 
 ---
 
-## v1 → v6 का सफर
+## v1 → v7 का सफर
 
 - **v2 (round-1: 12 fixes):** watchdog, parse_tick, tick_volume, spool, IST
 - **v3 (round-2: 15 fixes):** day-rollover, depth arrays, MODE=both reject
 - **v4 (round-3: 10 fixes):** ALTER migration, late-start guard, tick_uid
 - **v5 (round-4: 20 fixes):** SHA-256, auto-startup-gap, holiday API, quality
-- **v6 (round-5: 10 fixes):** see below
+- **v6 (round-5: 10 fixes):** --today, fetch_history tuple, pool retry, NaN safe
+- **v7 (round-6: 9 fixes):** see below
 
-### v6 round-5 fixes
+### v7 round-6 fixes
 
 | # | Bug                                                                    | Fix |
 |---|------------------------------------------------------------------------|-----|
-| 1 | **`--today` Friday→Monday gap miss** — startup_gap के `started_at` Friday था, today filter skip कर देता था | `ended_at >= today_start_ist` (Monday morning का startup_gap match होगा) |
-| 2 | **`fetch_history` 0-rows = API error** — illiquid stocks falsely marked failed | `(df, had_error)` tuple — empty result success, exception failure |
-| 3 | **`gap_filler` no pool retry** — DB temporary down पर cron crash | `make_pool_with_retry()` (10-attempt exponential, symmetric with collector) |
-| 4 | **`pandas` NaN volume → int(NaN) ValueError** — valid row drop | `pd.isna()` check + safe casting |
-| 5 | **DataFrame ts column missing** ("datetime"/"t"/"dt") → silent ALL ROWS skip | Extended column names + warning log if no ts found |
-| 6 | **`_hash_jsonb` NaN/Inf → ValueError** | `allow_nan=True` |
-| 7 | **`replay_gap_spool` N+1 connections** | Single transaction per file |
-| 8 | **Per-symbol startup gap** — global max(ts) misses symbols with older data | `min(max(ts) per symbol)` (conservative coverage) |
-| 9 | **Holiday cache redundant API calls** — cached years still re-fetched | `_LOADED_YEARS` set tracks which years done |
-| 10 | **Empty `closed_exchanges` list semantics** | Empty list = NSE open (not a holiday) |
+| 1 | **`fetch_history` JSON-error swallow** — broker `{"status":"error"}` को empty data treat कर रहा था → gap permanently lost | Explicit error detection: `status`, `error`, `errorMessage` keys check |
+| 2 | **`get_last_db_tick_ts` NULL trap** — कोई नया symbol = `min(NULL,...)`=NULL → startup gap skip | `WHERE max_ts IS NOT NULL` filter |
+| 3 | **NaN volume drops whole OHLC row** — `int(float(NaN))` ValueError पूरे row को drop करता था | OHLC parse और volume parse अलग — सिर्फ़ volume = None, OHLC valid रहता है |
+| 4 | **SQL queries miss `exchange` in GROUP BY** — index `(exchange,symbol,ts DESC)` use नहीं हो रहा था → seq scan | `WHERE exchange = %s` + `DISTINCT ON (exchange, symbol)` |
+| 5 | **`df_rows_in_window` numeric ts skip** — broker epoch int/float index → silent data loss | `isinstance(ts, (int, float))` branch |
+| 6 | **`compute_tick_volume` reconnect spike** — same-day reconnect: huge cum-prev एक tick में | `_LAST_TICK_TS` track + `RECONNECT_GAP_THRESHOLD_SEC` (60s default) → return 0 |
+| 7 | **JSONB NaN/Inf insert fail** — hash safe था, DB insert नहीं | `_clean_json()` recursive sanitizer (NaN→None) before `Jsonb()` |
+| 8 | **Schema `UPDATE` table lock on prod** | DO block conditional — सिर्फ़ तभी जब NULL rows मिलें |
+| 9 | **Holiday API unexpected type silent skip** | `else: log.warning("unexpected type")` |
 
 ### v5 round-4 fixes (20 critical issues, summary)
 

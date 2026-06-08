@@ -37,7 +37,18 @@ CREATE TABLE IF NOT EXISTS ticks (
 -- Idempotent migration columns
 ALTER TABLE ticks ADD COLUMN IF NOT EXISTS stream_type TEXT;
 ALTER TABLE ticks ALTER COLUMN stream_type SET DEFAULT 'quote';
-UPDATE ticks SET stream_type = 'quote' WHERE stream_type IS NULL;
+
+-- v7 FIX (Gemini): UPDATE in DO block — production table पर हर schema-run पर
+-- redundant full-scan UPDATE से बचाव। सिर्फ़ तभी चलेगा जब NULL rows मिलें।
+-- ⚠️ बहुत बड़े पुराने table पर एक बार table-lock हो सकता है — माइग्रेशन
+-- के समय off-hours में चलाएँ।
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM ticks WHERE stream_type IS NULL LIMIT 1) THEN
+        RAISE NOTICE 'Backfilling NULL stream_type — पुराने (v3-/v4-) data पर एक बार';
+        UPDATE ticks SET stream_type = 'quote' WHERE stream_type IS NULL;
+    END IF;
+END $$;
 ALTER TABLE ticks ALTER COLUMN stream_type SET NOT NULL;
 
 ALTER TABLE ticks ADD COLUMN IF NOT EXISTS tick_volume BIGINT;

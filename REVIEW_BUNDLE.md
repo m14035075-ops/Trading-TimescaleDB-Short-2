@@ -1,48 +1,30 @@
-# NSE Tick Collector — Full Code Review Bundle (v6)
+# NSE Tick Collector — Full Code Review Bundle (v7)
 
 > **For ChatGPT / Gemini / Claude / Qwen / Kimi reviewers:**
-> यह **v6** है — round-1 (12) + round-2 (15) + round-3 (10) + round-4 (20) + round-5 (10) = **67 review issues fixed**।
+> यह **v7** है — round-1 (12) + round-2 (15) + round-3 (10) + round-4 (20) + round-5 (10) + round-6 (9) = **76 review issues fixed**।
 >
-> **v6 round-5 के prominent changes:**
-> - `--today`: filter `ended_at >= today_start_ist` (Friday→Monday gap अब cover होगा)
-> - `fetch_history` returns `(df, had_error)` — 0 rows ≠ API error
-> - `gap_filler` pool retry (10-attempt) symmetric with collector
-> - NaN volume safe cast via `pd.isna()`
-> - DataFrame ts column robust (datetime/t/dt + warning log)
-> - `_hash_jsonb` `allow_nan=True`
-> - `replay_gap_spool` single-transaction per file
-> - Per-symbol startup gap: `min(max(ts) per symbol)`
-> - Holiday cache `_LOADED_YEARS` tracking
-> - Empty `closed_exchanges` semantics fixed
+> **v7 round-6 के prominent changes:**
+> - `fetch_history`: explicit broker JSON-error detection (status/error/errorMessage)
+> - `get_last_db_tick_ts`: NULL trap fix (`WHERE max_ts IS NOT NULL`)
+> - SQL queries: `WHERE exchange = %s` + `DISTINCT ON (exchange, symbol)` for index utilization
+> - `df_rows_in_window`: NaN volume isolated (OHLC preserved); numeric epoch ts handled
+> - `compute_tick_volume`: same-day reconnect spike fix via `_LAST_TICK_TS` + `RECONNECT_GAP_THRESHOLD_SEC`
+> - `_clean_json()` recursive NaN/Inf sanitizer before JSONB insert
+> - Schema UPDATE in DO block (no table lock on idempotent re-runs)
+> - Holiday API unexpected-type warning
 >
-> **अब verify करना है:**
-> 1. `--today` overlap edge cases — what if gap started AND ended yesterday?
-> 2. `fetch_history` empty-result semantics — broker variations?
-> 3. Per-symbol min(max_ts) gap query performance on huge tables?
-> 4. NaN volume cast — DataFrame edge cases (None vs NaN vs 'N/A' string)?
-> 5. Pool retry exponential — DB-down for 30 min scenarios?
+> **Verify:**
+> 1. `_LAST_TICK_TS` thread-safety (mutated inside _VOL_LOCK)
+> 2. RECONNECT_GAP_THRESHOLD_SEC=60 — low-liquidity stocks में false positives?
+> 3. JSON error detection — broker variations (`status`, `error`, `errorMessage`) covered?
+> 4. NaN sanitizer recursion depth — payload size limits?
+> 5. SQL queries with index hints — verify EXPLAIN plan
 
 ---
 
-## Project structure
+## File 1 of 8 — \`schema.sql\`
 
-```
-Trading-TimescaleDB-Short-2/
-├── schema.sql          UNIQUE indexes + smart views with quality
-├── collector.py        Per-symbol startup-gap, allow_nan hash, single-tx replay
-├── gap_filler.py       --today overlap, (df, error) tuple, pool retry, NaN-safe
-├── symbols.txt
-├── requirements.txt    + pandas
-├── .env.example
-├── .gitignore
-└── README.md
-```
-
----
-
-## File 1 of 8 — `schema.sql`
-
-```sql
+\`\`\`sql
 -- =====================================================================
 -- NSE Tick Collector — TimescaleDB Schema  (v5 — round-4 review fixes)
 -- =====================================================================
@@ -82,7 +64,18 @@ CREATE TABLE IF NOT EXISTS ticks (
 -- Idempotent migration columns
 ALTER TABLE ticks ADD COLUMN IF NOT EXISTS stream_type TEXT;
 ALTER TABLE ticks ALTER COLUMN stream_type SET DEFAULT 'quote';
-UPDATE ticks SET stream_type = 'quote' WHERE stream_type IS NULL;
+
+-- v7 FIX (Gemini): UPDATE in DO block — production table पर हर schema-run पर
+-- redundant full-scan UPDATE से बचाव। सिर्फ़ तभी चलेगा जब NULL rows मिलें।
+-- ⚠️ बहुत बड़े पुराने table पर एक बार table-lock हो सकता है — माइग्रेशन
+-- के समय off-hours में चलाएँ।
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM ticks WHERE stream_type IS NULL LIMIT 1) THEN
+        RAISE NOTICE 'Backfilling NULL stream_type — पुराने (v3-/v4-) data पर एक बार';
+        UPDATE ticks SET stream_type = 'quote' WHERE stream_type IS NULL;
+    END IF;
+END $$;
 ALTER TABLE ticks ALTER COLUMN stream_type SET NOT NULL;
 
 ALTER TABLE ticks ADD COLUMN IF NOT EXISTS tick_volume BIGINT;
@@ -257,7 +250,7 @@ ORDER  BY ts, exchange, symbol,
 
 ---
 
-## File 2 of 8 — `collector.py`  (856 lines)
+## File 2 of 8 — `collector.py`  (902 lines)
 
 ```python
 """
@@ -419,22 +412,31 @@ def is_market_hours(ts: datetime | None = None) -> bool:
 # ---------------------------------------------------------------------------
 # Per-symbol cumulative-volume tracker
 # ---------------------------------------------------------------------------
-_LAST_CUM_VOL:  dict[str, int]  = {}
-_LAST_TICK_DAY: dict[str, date] = {}
+_LAST_CUM_VOL:  dict[str, int]      = {}
+_LAST_TICK_DAY: dict[str, date]     = {}
+_LAST_TICK_TS:  dict[str, datetime] = {}    # v7: per-symbol last-tick time
 _VOL_LOCK = threading.Lock()
+
+# v7 FIX (ChatGPT #2): same-day reconnect detection — इतने seconds बिना tick के
+# बाद आया tick = reconnect; cumulative delta को एक tick में credit नहीं करते
+# (gap_filler उसे history bars से भरेगा)।
+RECONNECT_GAP_SEC = int(os.getenv("RECONNECT_GAP_THRESHOLD_SEC", "60"))
 
 
 def seed_last_cum_vol(pool: ConnectionPool) -> None:
+    """v7 FIX (Gemini): exchange filter + DISTINCT ON (exchange, symbol)
+    ताकि idx_ticks_ex_sym_ts का proper use हो — startup पर seq-scan नहीं।"""
     sql = """
-        SELECT DISTINCT ON (symbol) symbol, volume, ts
+        SELECT DISTINCT ON (exchange, symbol) symbol, volume, ts
         FROM   ticks
-        WHERE  volume IS NOT NULL
+        WHERE  exchange = %s
+          AND  volume IS NOT NULL
           AND  ts >= now() - INTERVAL '7 days'
-        ORDER  BY symbol, ts DESC
+        ORDER  BY exchange, symbol, ts DESC
     """
     try:
         with pool.connection() as con, con.cursor() as cur:
-            cur.execute(sql)
+            cur.execute(sql, (EXCHANGE,))
             for sym, vol, ts in cur.fetchall():
                 _LAST_CUM_VOL[sym]  = int(vol)
                 _LAST_TICK_DAY[sym] = ts.astimezone(IST).date()
@@ -445,21 +447,25 @@ def seed_last_cum_vol(pool: ConnectionPool) -> None:
 
 def get_last_db_tick_ts(pool: ConnectionPool) -> datetime | None:
     """
-    v6 FIX (ChatGPT #5): per-symbol min(max(ts)) — सबसे stale symbol का
-    last-seen time वाला conservative gap रिकॉर्ड करते हैं ताकि कोई
-    symbol coverage छूटे न।
+    v7 FIXES:
+      (Gemini): exchange filter + GROUP BY (index use)
+      (Qwen #1): WHERE max_ts IS NOT NULL — कोई नया symbol हो तो min()=NULL
+                 ट्रैप से बचो; अन्यथा startup gap recording skip हो जाता था।
     """
     try:
         with pool.connection() as con, con.cursor() as cur:
             cur.execute("""
                 WITH per_symbol AS (
-                    SELECT symbol, max(ts) AS max_ts
+                    SELECT exchange, symbol, max(ts) AS max_ts
                     FROM   ticks
-                    WHERE  ts >= now() - INTERVAL '7 days'
-                    GROUP  BY symbol
+                    WHERE  exchange = %s
+                      AND  ts >= now() - INTERVAL '7 days'
+                    GROUP  BY exchange, symbol
                 )
-                SELECT min(max_ts) FROM per_symbol
-            """)
+                SELECT min(max_ts)
+                FROM   per_symbol
+                WHERE  max_ts IS NOT NULL
+            """, (EXCHANGE,))
             row = cur.fetchone()
         return row[0] if row and row[0] else None
     except Exception as e:                                      # noqa: BLE001
@@ -492,27 +498,40 @@ def compute_tick_volume(symbol: str, cum_vol: int | None,
     with _VOL_LOCK:
         prev      = _LAST_CUM_VOL.get(symbol)
         prev_day  = _LAST_TICK_DAY.get(symbol)
+        prev_ts   = _LAST_TICK_TS.get(symbol)
 
         # (1) day rollover
         if prev_day is not None and tick_day != prev_day:
             _LAST_CUM_VOL[symbol]  = cum_vol
             _LAST_TICK_DAY[symbol] = tick_day
+            _LAST_TICK_TS[symbol]  = tick_ts
             if in_open_window:
                 return cum_vol
-            log.debug("rollover late-start %s @ %s — return 0 (gap_filler)",
-                      symbol, tick_ist.time())
             return 0
 
         # (2) mid-day glitch
         if prev is not None and cum_vol < prev:
-            log.debug("volume glitch %s: cum=%d < prev=%d (same day) — ignore",
-                      symbol, cum_vol, prev)
+            log.debug("volume glitch %s: cum=%d < prev=%d", symbol, cum_vol, prev)
             return 0
+
+        # (2b) v7 FIX (ChatGPT #2): same-day reconnect detection
+        # बड़ा time-gap = WS reconnect; cumulative delta को एक tick में
+        # credit नहीं करते (gap_filler उसे history bars से भरेगा)।
+        if prev_ts is not None:
+            gap_sec = (tick_ts - prev_ts).total_seconds()
+            if gap_sec > RECONNECT_GAP_SEC:
+                log.debug("reconnect gap %s: %.0fs since prev tick — return 0",
+                          symbol, gap_sec)
+                _LAST_CUM_VOL[symbol]  = cum_vol
+                _LAST_TICK_DAY[symbol] = tick_day
+                _LAST_TICK_TS[symbol]  = tick_ts
+                return 0
 
         # (3) first-ever tick
         if prev is None:
             _LAST_CUM_VOL[symbol]  = cum_vol
             _LAST_TICK_DAY[symbol] = tick_day
+            _LAST_TICK_TS[symbol]  = tick_ts
             if in_open_window:
                 return cum_vol
             return 0
@@ -520,6 +539,7 @@ def compute_tick_volume(symbol: str, cum_vol: int | None,
         # (4) normal increase
         _LAST_CUM_VOL[symbol]  = cum_vol
         _LAST_TICK_DAY[symbol] = tick_day
+        _LAST_TICK_TS[symbol]  = tick_ts
         return cum_vol - prev
 
 
@@ -631,8 +651,26 @@ def _norm_float(v: Any) -> str:
         return "<NAN>"
 
 
+import math
+
+
+def _clean_json(x: Any) -> Any:
+    """
+    v7 FIX (ChatGPT #8): NaN/Inf floats को None replace — JSONB insert safe।
+    PostgreSQL JSONB raw NaN/Infinity reject करता है।
+    """
+    if isinstance(x, float):
+        return None if not math.isfinite(x) else x
+    if isinstance(x, dict):
+        return {k: _clean_json(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_clean_json(v) for v in x]
+    return x
+
+
 def _hash_jsonb(j: Any) -> str:
-    """v6 FIX (Qwen): allow_nan=True — broker के NaN/Inf floats crash न करें।"""
+    """v6 FIX (Qwen): allow_nan=True — hash safe। JSONB insert के लिए
+       _clean_json अलग से इस्तेमाल होता है।"""
     if j is None:
         return ""
     obj = j.obj if isinstance(j, Jsonb) else j
@@ -735,8 +773,9 @@ def parse_tick(payload: dict[str, Any], default_exchange: str,
             "low":         _to_float(_pick(payload, inner, "low")),
             "close":       _to_float(_pick(payload, inner, "prev_close",
                                            "previous_close")),
-            "depth":       Jsonb(depth_obj) if depth_obj is not None else None,
-            "raw":         Jsonb(payload) if STORE_RAW_PAYLOAD else None,
+            # v7 FIX (ChatGPT #8): NaN/Inf sanitize before JSONB insert
+            "depth":       Jsonb(_clean_json(depth_obj)) if depth_obj is not None else None,
+            "raw":         Jsonb(_clean_json(payload)) if STORE_RAW_PAYLOAD else None,
         }
         row["tick_uid"] = make_tick_uid(row)
         return row
@@ -1120,7 +1159,7 @@ if __name__ == "__main__":
 
 ---
 
-## File 3 of 8 — `gap_filler.py`  (463 lines)
+## File 3 of 8 — `gap_filler.py`  (501 lines)
 
 ```python
 """
@@ -1269,6 +1308,10 @@ def _load_holidays(client, years: set[int] | None = None) -> set[date]:
                     break
         elif isinstance(resp, list):
             items = resp
+        else:
+            # v7 FIX (Qwen): unexpected type — debugging के लिए warning
+            log.warning("unexpected holidays(%d) response type: %s",
+                        y, type(resp).__name__)
 
         for h in items:
             if not isinstance(h, dict):
@@ -1371,6 +1414,19 @@ def fetch_history(client, symbol: str, sd: str, ed: str
     if not hasattr(df, "iterrows"):
         try:
             if isinstance(df, dict):
+                # v7 FIX (Gemini #2): explicit API JSON error detection
+                # broker कभी-कभी 200 OK में भी {"status":"error", ...} भेजता है
+                status_str = str(df.get("status", "")).lower()
+                if (status_str in ("error", "failure", "fail")
+                        or df.get("error")
+                        or df.get("errorMessage")):
+                    log.warning(
+                        "history JSON error %s: %s",
+                        symbol,
+                        df.get("message") or df.get("error") or df,
+                    )
+                    return None, True                            # treat as API error
+
                 df = (df.get("data") or df.get("candles") or
                       df.get("history") or [])
             df = pd.DataFrame(df)
@@ -1407,9 +1463,16 @@ def df_rows_in_window(df, start: datetime, end: datetime,
     end_floor   = floor_minute(end)
     rows: list[tuple] = []
     for ts, row in df.iterrows():
-        # v5 FIX: defensive ts conversion
+        # v5/v7 FIX: defensive ts conversion (numeric epoch भी handle)
         if hasattr(ts, "to_pydatetime"):
             py_ts = ts.to_pydatetime()
+        elif isinstance(ts, (int, float)):
+            # v7 FIX (ChatGPT #3): broker कभी-कभी unix epoch भेजता है
+            ts_val = ts / 1000.0 if abs(ts) > 1e12 else float(ts)
+            try:
+                py_ts = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                continue
         elif isinstance(ts, str):
             try:
                 py_ts = datetime.fromisoformat(ts)
@@ -1424,21 +1487,35 @@ def df_rows_in_window(df, start: datetime, end: datetime,
         ts_utc = py_ts.astimezone(timezone.utc)
         if not (start_floor <= ts_utc <= end_floor):
             continue
+
+        # v7 FIX (Gemini #4 / Qwen #2): NaN/string-volume row drop न करे —
+        # सिर्फ़ volume = None, OHLC अब भी valid → row preserve
         try:
-            # v6 FIX (Gemini): NaN volume safe cast
-            vol_raw = row["volume"] if "volume" in row else None
-            if vol_raw is None or pd.isna(vol_raw):
-                vol_clean: int | None = None
-            else:
-                vol_clean = int(float(vol_raw))
-            rows.append((
-                ts_utc, EXCHANGE, symbol,
-                float(row["open"]), float(row["high"]),
-                float(row["low"]),  float(row["close"]),
-                vol_clean,
-            ))
+            ohlc = (
+                float(row["open"]),
+                float(row["high"]),
+                float(row["low"]),
+                float(row["close"]),
+            )
         except (KeyError, TypeError, ValueError) as e:
-            log.warning("row parse fail %s @ %s: %s", symbol, ts_utc, e)
+            log.warning("OHLC parse fail %s @ %s: %s", symbol, ts_utc, e)
+            continue
+
+        vol_raw = row.get("volume") if hasattr(row, "get") else (
+            row["volume"] if "volume" in row else None
+        )
+        vol_clean: int | None = None
+        if vol_raw is not None and not pd.isna(vol_raw):
+            try:
+                vol_clean = int(float(vol_raw))
+            except (TypeError, ValueError):
+                log.debug("invalid volume %s @ %s: %r", symbol, ts_utc, vol_raw)
+
+        rows.append((
+            ts_utc, EXCHANGE, symbol,
+            ohlc[0], ohlc[1], ohlc[2], ohlc[3],
+            vol_clean,
+        ))
     return rows
 
 
@@ -1638,6 +1715,11 @@ RECONNECT_MAX_DELAY=60
 # v5: default 60 (पहले 30 था — low-liquidity false positives)
 WATCHDOG_TIMEOUT_SEC=60
 
+# v7: same-day reconnect spike protection — इतने seconds बिना tick के बाद
+# जो tick आए वह reconnect माना जाता है, cumulative delta को 0 कर देते हैं
+# (gap_filler उस window को history से भर देगा)
+RECONNECT_GAP_THRESHOLD_SEC=60
+
 # DB fail पर failed rows यहाँ JSONL में spool, startup पर replay
 SPOOL_DIR=./spool
 
@@ -1723,62 +1805,48 @@ __pycache__/
 ## File 8 of 8 — `README.md`
 
 ````markdown
-# NSE Tick Collector — Hindi गाइड (v6)
+# NSE Tick Collector — Hindi गाइड (v7)
 
 > 50 भारतीय शेयरों का **live tick data** OpenAlgo WebSocket से उठाकर अपने ही
 > server के **TimescaleDB** में store करने वाला production-grade project।
-> v6 में ChatGPT + Gemini + Qwen + Kimi के **5 rounds का review** लागू है —
-> कुल **67+ bugs fix**।
+> v7 में ChatGPT + Gemini + Qwen + Kimi के **6 rounds का review** लागू है —
+> कुल **76+ bugs fix**।
 
 ---
 
-## v1 → v6 का सफर
+## v1 → v7 का सफर
 
 - **v2 (round-1: 12 fixes):** watchdog, parse_tick, tick_volume, spool, IST
 - **v3 (round-2: 15 fixes):** day-rollover, depth arrays, MODE=both reject
 - **v4 (round-3: 10 fixes):** ALTER migration, late-start guard, tick_uid
 - **v5 (round-4: 20 fixes):** SHA-256, auto-startup-gap, holiday API, quality
-- **v6 (round-5: 10 fixes):** see below
+- **v6 (round-5: 10 fixes):** --today, fetch_history tuple, pool retry, NaN safe
+- **v7 (round-6: 9 fixes):** see below
 
-### v6 round-5 fixes
-
-| # | Bug                                                                    | Fix |
-|---|------------------------------------------------------------------------|-----|
-| 1 | **`--today` Friday→Monday gap miss** — startup_gap के `started_at` Friday था, today filter skip कर देता था | `ended_at >= today_start_ist` (Monday morning का startup_gap match होगा) |
-| 2 | **`fetch_history` 0-rows = API error** — illiquid stocks falsely marked failed | `(df, had_error)` tuple — empty result success, exception failure |
-| 3 | **`gap_filler` no pool retry** — DB temporary down पर cron crash | `make_pool_with_retry()` (10-attempt exponential, symmetric with collector) |
-| 4 | **`pandas` NaN volume → int(NaN) ValueError** — valid row drop | `pd.isna()` check + safe casting |
-| 5 | **DataFrame ts column missing** ("datetime"/"t"/"dt") → silent ALL ROWS skip | Extended column names + warning log if no ts found |
-| 6 | **`_hash_jsonb` NaN/Inf → ValueError** | `allow_nan=True` |
-| 7 | **`replay_gap_spool` N+1 connections** | Single transaction per file |
-| 8 | **Per-symbol startup gap** — global max(ts) misses symbols with older data | `min(max(ts) per symbol)` (conservative coverage) |
-| 9 | **Holiday cache redundant API calls** — cached years still re-fetched | `_LOADED_YEARS` set tracks which years done |
-| 10 | **Empty `closed_exchanges` list semantics** | Empty list = NSE open (not a holiday) |
-
-### v5 round-4 fixes (20 critical issues)
+### v7 round-6 fixes
 
 | # | Bug                                                                    | Fix |
 |---|------------------------------------------------------------------------|-----|
-| 1 | `tick_uid` hash incomplete — depth/raw missing, unstable float, 0/None collapse | 32-char SHA-256 + content hash for depth/raw + `_norm()` (None vs 0) + `f"{x:.6f}"` |
-| 2 | **Monday-restart volume loss** — day rollover after 9:30 lost data    | Auto-startup-gap recording: last DB tick से अब तक का gap on first connect |
-| 3 | `collector_gaps` no UNIQUE → spool replay duplicates                   | UNIQUE(started_at, ended_at, COALESCE(reason,'')) + ON CONFLICT DO NOTHING |
-| 4 | `gap_minutes` SQL last-partial-minute miss                             | `time_bucket` floor on BOTH ends of generate_series |
-| 5 | `v_quotes_1m_raw` history filter missing (always included)             | `WHERE lm.ts IS NULL OR gm.ts IS NOT NULL` |
-| 6 | Quality priority wrong (`full > history > sparse > partial`)            | New: `full > sparse > history > partial` (live real > history fill) |
-| 7 | `--today` IST timezone bug (UTC truncation)                            | `(now() AT TIME ZONE 'Asia/Kolkata')::date AT TIME ZONE 'Asia/Kolkata'` |
-| 8 | `df_rows_in_window` crashes on list/dict response                      | Defensive: convert to DataFrame; handle `to_pydatetime`/string/datetime |
-| 9 | NSE holidays parsing fragile (settlement holidays counted, date format breaks) | `closed_exchanges`/`holiday_type` filter + multi-format parser + dynamic year range |
-| 10 | Multi-day partial gap success                                          | `failed_days` tracking; failure ONLY on API errors |
-| 11 | SQL injection pattern in gap_filler                                    | `psycopg.sql` composition |
-| 12 | `_parse_timestamp` matches non-timestamps ("1.5" → 1970)               | Strict regex + range check (2000-2100) |
-| 13 | Pool startup fragility (DB down at startup = crash)                    | Retry loop with exponential backoff (10 attempts) |
-| 14 | Flusher buffer loss on hang                                            | Lock-protected `buf` + `take_buffer_snapshot()` on shutdown |
-| 15 | `requirements.txt` missing pandas, version mismatch                    | `pandas>=2.0.0`, `psycopg-pool>=3.2` |
-| 16 | `.env.example` v3 header                                               | v5 |
-| 17 | Watchdog 30s false positives in low liquidity                          | Default 60s |
-| 18 | `fill_one_gap` over-strict (15:25-15:35 false-fail)                    | Failure only on API errors, not 0-rows |
-| 19 | Holiday cache static years                                             | Dynamic from gap dates |
-| 20 | Tick_uid 16-char (~10 days at scale possibly)                          | 32 chars (128-bit safe for billions) |
+| 1 | **`fetch_history` JSON-error swallow** — broker `{"status":"error"}` को empty data treat कर रहा था → gap permanently lost | Explicit error detection: `status`, `error`, `errorMessage` keys check |
+| 2 | **`get_last_db_tick_ts` NULL trap** — कोई नया symbol = `min(NULL,...)`=NULL → startup gap skip | `WHERE max_ts IS NOT NULL` filter |
+| 3 | **NaN volume drops whole OHLC row** — `int(float(NaN))` ValueError पूरे row को drop करता था | OHLC parse और volume parse अलग — सिर्फ़ volume = None, OHLC valid रहता है |
+| 4 | **SQL queries miss `exchange` in GROUP BY** — index `(exchange,symbol,ts DESC)` use नहीं हो रहा था → seq scan | `WHERE exchange = %s` + `DISTINCT ON (exchange, symbol)` |
+| 5 | **`df_rows_in_window` numeric ts skip** — broker epoch int/float index → silent data loss | `isinstance(ts, (int, float))` branch |
+| 6 | **`compute_tick_volume` reconnect spike** — same-day reconnect: huge cum-prev एक tick में | `_LAST_TICK_TS` track + `RECONNECT_GAP_THRESHOLD_SEC` (60s default) → return 0 |
+| 7 | **JSONB NaN/Inf insert fail** — hash safe था, DB insert नहीं | `_clean_json()` recursive sanitizer (NaN→None) before `Jsonb()` |
+| 8 | **Schema `UPDATE` table lock on prod** | DO block conditional — सिर्फ़ तभी जब NULL rows मिलें |
+| 9 | **Holiday API unexpected type silent skip** | `else: log.warning("unexpected type")` |
+
+### v5 round-4 fixes (20 critical issues, summary)
+
+tick_uid 32-char SHA-256 + depth/raw hash, auto-startup-gap recording,
+collector_gaps UNIQUE constraint, gap_minutes time_bucket floor,
+v_quotes_1m_raw history filter, quality priority full>sparse>history>partial,
+--today IST fix, df_rows_in_window defensive, NSE holidays robust parsing,
+multi-day failed_days tracking, psycopg.sql composition, _parse_timestamp
+range check, pool startup retry, flusher buf lock, requirements pandas+pool,
+.env v5 header, watchdog 60s default, fill_one_gap lenient (no false-fail
+on 0-rows), dynamic holiday year cache, tick_uid 32-char (128-bit safe).
 
 ---
 
@@ -1993,4 +2061,4 @@ Trading-TimescaleDB-Short-2/
 
 ---
 
-## End of bundle — Total: 8 files, 1897 lines.
+## End of bundle — Total: 8 files, 1983 lines.

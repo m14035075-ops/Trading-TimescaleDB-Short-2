@@ -144,6 +144,10 @@ def _load_holidays(client, years: set[int] | None = None) -> set[date]:
                     break
         elif isinstance(resp, list):
             items = resp
+        else:
+            # v7 FIX (Qwen): unexpected type — debugging के लिए warning
+            log.warning("unexpected holidays(%d) response type: %s",
+                        y, type(resp).__name__)
 
         for h in items:
             if not isinstance(h, dict):
@@ -246,6 +250,19 @@ def fetch_history(client, symbol: str, sd: str, ed: str
     if not hasattr(df, "iterrows"):
         try:
             if isinstance(df, dict):
+                # v7 FIX (Gemini #2): explicit API JSON error detection
+                # broker कभी-कभी 200 OK में भी {"status":"error", ...} भेजता है
+                status_str = str(df.get("status", "")).lower()
+                if (status_str in ("error", "failure", "fail")
+                        or df.get("error")
+                        or df.get("errorMessage")):
+                    log.warning(
+                        "history JSON error %s: %s",
+                        symbol,
+                        df.get("message") or df.get("error") or df,
+                    )
+                    return None, True                            # treat as API error
+
                 df = (df.get("data") or df.get("candles") or
                       df.get("history") or [])
             df = pd.DataFrame(df)
@@ -282,9 +299,16 @@ def df_rows_in_window(df, start: datetime, end: datetime,
     end_floor   = floor_minute(end)
     rows: list[tuple] = []
     for ts, row in df.iterrows():
-        # v5 FIX: defensive ts conversion
+        # v5/v7 FIX: defensive ts conversion (numeric epoch भी handle)
         if hasattr(ts, "to_pydatetime"):
             py_ts = ts.to_pydatetime()
+        elif isinstance(ts, (int, float)):
+            # v7 FIX (ChatGPT #3): broker कभी-कभी unix epoch भेजता है
+            ts_val = ts / 1000.0 if abs(ts) > 1e12 else float(ts)
+            try:
+                py_ts = datetime.fromtimestamp(ts_val, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                continue
         elif isinstance(ts, str):
             try:
                 py_ts = datetime.fromisoformat(ts)
@@ -299,21 +323,35 @@ def df_rows_in_window(df, start: datetime, end: datetime,
         ts_utc = py_ts.astimezone(timezone.utc)
         if not (start_floor <= ts_utc <= end_floor):
             continue
+
+        # v7 FIX (Gemini #4 / Qwen #2): NaN/string-volume row drop न करे —
+        # सिर्फ़ volume = None, OHLC अब भी valid → row preserve
         try:
-            # v6 FIX (Gemini): NaN volume safe cast
-            vol_raw = row["volume"] if "volume" in row else None
-            if vol_raw is None or pd.isna(vol_raw):
-                vol_clean: int | None = None
-            else:
-                vol_clean = int(float(vol_raw))
-            rows.append((
-                ts_utc, EXCHANGE, symbol,
-                float(row["open"]), float(row["high"]),
-                float(row["low"]),  float(row["close"]),
-                vol_clean,
-            ))
+            ohlc = (
+                float(row["open"]),
+                float(row["high"]),
+                float(row["low"]),
+                float(row["close"]),
+            )
         except (KeyError, TypeError, ValueError) as e:
-            log.warning("row parse fail %s @ %s: %s", symbol, ts_utc, e)
+            log.warning("OHLC parse fail %s @ %s: %s", symbol, ts_utc, e)
+            continue
+
+        vol_raw = row.get("volume") if hasattr(row, "get") else (
+            row["volume"] if "volume" in row else None
+        )
+        vol_clean: int | None = None
+        if vol_raw is not None and not pd.isna(vol_raw):
+            try:
+                vol_clean = int(float(vol_raw))
+            except (TypeError, ValueError):
+                log.debug("invalid volume %s @ %s: %r", symbol, ts_utc, vol_raw)
+
+        rows.append((
+            ts_utc, EXCHANGE, symbol,
+            ohlc[0], ohlc[1], ohlc[2], ohlc[3],
+            vol_clean,
+        ))
     return rows
 
 

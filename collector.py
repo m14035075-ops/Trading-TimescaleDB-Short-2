@@ -157,22 +157,31 @@ def is_market_hours(ts: datetime | None = None) -> bool:
 # ---------------------------------------------------------------------------
 # Per-symbol cumulative-volume tracker
 # ---------------------------------------------------------------------------
-_LAST_CUM_VOL:  dict[str, int]  = {}
-_LAST_TICK_DAY: dict[str, date] = {}
+_LAST_CUM_VOL:  dict[str, int]      = {}
+_LAST_TICK_DAY: dict[str, date]     = {}
+_LAST_TICK_TS:  dict[str, datetime] = {}    # v7: per-symbol last-tick time
 _VOL_LOCK = threading.Lock()
+
+# v7 FIX (ChatGPT #2): same-day reconnect detection — इतने seconds बिना tick के
+# बाद आया tick = reconnect; cumulative delta को एक tick में credit नहीं करते
+# (gap_filler उसे history bars से भरेगा)।
+RECONNECT_GAP_SEC = int(os.getenv("RECONNECT_GAP_THRESHOLD_SEC", "60"))
 
 
 def seed_last_cum_vol(pool: ConnectionPool) -> None:
+    """v7 FIX (Gemini): exchange filter + DISTINCT ON (exchange, symbol)
+    ताकि idx_ticks_ex_sym_ts का proper use हो — startup पर seq-scan नहीं।"""
     sql = """
-        SELECT DISTINCT ON (symbol) symbol, volume, ts
+        SELECT DISTINCT ON (exchange, symbol) symbol, volume, ts
         FROM   ticks
-        WHERE  volume IS NOT NULL
+        WHERE  exchange = %s
+          AND  volume IS NOT NULL
           AND  ts >= now() - INTERVAL '7 days'
-        ORDER  BY symbol, ts DESC
+        ORDER  BY exchange, symbol, ts DESC
     """
     try:
         with pool.connection() as con, con.cursor() as cur:
-            cur.execute(sql)
+            cur.execute(sql, (EXCHANGE,))
             for sym, vol, ts in cur.fetchall():
                 _LAST_CUM_VOL[sym]  = int(vol)
                 _LAST_TICK_DAY[sym] = ts.astimezone(IST).date()
@@ -183,21 +192,25 @@ def seed_last_cum_vol(pool: ConnectionPool) -> None:
 
 def get_last_db_tick_ts(pool: ConnectionPool) -> datetime | None:
     """
-    v6 FIX (ChatGPT #5): per-symbol min(max(ts)) — सबसे stale symbol का
-    last-seen time वाला conservative gap रिकॉर्ड करते हैं ताकि कोई
-    symbol coverage छूटे न।
+    v7 FIXES:
+      (Gemini): exchange filter + GROUP BY (index use)
+      (Qwen #1): WHERE max_ts IS NOT NULL — कोई नया symbol हो तो min()=NULL
+                 ट्रैप से बचो; अन्यथा startup gap recording skip हो जाता था।
     """
     try:
         with pool.connection() as con, con.cursor() as cur:
             cur.execute("""
                 WITH per_symbol AS (
-                    SELECT symbol, max(ts) AS max_ts
+                    SELECT exchange, symbol, max(ts) AS max_ts
                     FROM   ticks
-                    WHERE  ts >= now() - INTERVAL '7 days'
-                    GROUP  BY symbol
+                    WHERE  exchange = %s
+                      AND  ts >= now() - INTERVAL '7 days'
+                    GROUP  BY exchange, symbol
                 )
-                SELECT min(max_ts) FROM per_symbol
-            """)
+                SELECT min(max_ts)
+                FROM   per_symbol
+                WHERE  max_ts IS NOT NULL
+            """, (EXCHANGE,))
             row = cur.fetchone()
         return row[0] if row and row[0] else None
     except Exception as e:                                      # noqa: BLE001
@@ -230,27 +243,40 @@ def compute_tick_volume(symbol: str, cum_vol: int | None,
     with _VOL_LOCK:
         prev      = _LAST_CUM_VOL.get(symbol)
         prev_day  = _LAST_TICK_DAY.get(symbol)
+        prev_ts   = _LAST_TICK_TS.get(symbol)
 
         # (1) day rollover
         if prev_day is not None and tick_day != prev_day:
             _LAST_CUM_VOL[symbol]  = cum_vol
             _LAST_TICK_DAY[symbol] = tick_day
+            _LAST_TICK_TS[symbol]  = tick_ts
             if in_open_window:
                 return cum_vol
-            log.debug("rollover late-start %s @ %s — return 0 (gap_filler)",
-                      symbol, tick_ist.time())
             return 0
 
         # (2) mid-day glitch
         if prev is not None and cum_vol < prev:
-            log.debug("volume glitch %s: cum=%d < prev=%d (same day) — ignore",
-                      symbol, cum_vol, prev)
+            log.debug("volume glitch %s: cum=%d < prev=%d", symbol, cum_vol, prev)
             return 0
+
+        # (2b) v7 FIX (ChatGPT #2): same-day reconnect detection
+        # बड़ा time-gap = WS reconnect; cumulative delta को एक tick में
+        # credit नहीं करते (gap_filler उसे history bars से भरेगा)।
+        if prev_ts is not None:
+            gap_sec = (tick_ts - prev_ts).total_seconds()
+            if gap_sec > RECONNECT_GAP_SEC:
+                log.debug("reconnect gap %s: %.0fs since prev tick — return 0",
+                          symbol, gap_sec)
+                _LAST_CUM_VOL[symbol]  = cum_vol
+                _LAST_TICK_DAY[symbol] = tick_day
+                _LAST_TICK_TS[symbol]  = tick_ts
+                return 0
 
         # (3) first-ever tick
         if prev is None:
             _LAST_CUM_VOL[symbol]  = cum_vol
             _LAST_TICK_DAY[symbol] = tick_day
+            _LAST_TICK_TS[symbol]  = tick_ts
             if in_open_window:
                 return cum_vol
             return 0
@@ -258,6 +284,7 @@ def compute_tick_volume(symbol: str, cum_vol: int | None,
         # (4) normal increase
         _LAST_CUM_VOL[symbol]  = cum_vol
         _LAST_TICK_DAY[symbol] = tick_day
+        _LAST_TICK_TS[symbol]  = tick_ts
         return cum_vol - prev
 
 
@@ -369,8 +396,26 @@ def _norm_float(v: Any) -> str:
         return "<NAN>"
 
 
+import math
+
+
+def _clean_json(x: Any) -> Any:
+    """
+    v7 FIX (ChatGPT #8): NaN/Inf floats को None replace — JSONB insert safe।
+    PostgreSQL JSONB raw NaN/Infinity reject करता है।
+    """
+    if isinstance(x, float):
+        return None if not math.isfinite(x) else x
+    if isinstance(x, dict):
+        return {k: _clean_json(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_clean_json(v) for v in x]
+    return x
+
+
 def _hash_jsonb(j: Any) -> str:
-    """v6 FIX (Qwen): allow_nan=True — broker के NaN/Inf floats crash न करें।"""
+    """v6 FIX (Qwen): allow_nan=True — hash safe। JSONB insert के लिए
+       _clean_json अलग से इस्तेमाल होता है।"""
     if j is None:
         return ""
     obj = j.obj if isinstance(j, Jsonb) else j
@@ -473,8 +518,9 @@ def parse_tick(payload: dict[str, Any], default_exchange: str,
             "low":         _to_float(_pick(payload, inner, "low")),
             "close":       _to_float(_pick(payload, inner, "prev_close",
                                            "previous_close")),
-            "depth":       Jsonb(depth_obj) if depth_obj is not None else None,
-            "raw":         Jsonb(payload) if STORE_RAW_PAYLOAD else None,
+            # v7 FIX (ChatGPT #8): NaN/Inf sanitize before JSONB insert
+            "depth":       Jsonb(_clean_json(depth_obj)) if depth_obj is not None else None,
+            "raw":         Jsonb(_clean_json(payload)) if STORE_RAW_PAYLOAD else None,
         }
         row["tick_uid"] = make_tick_uid(row)
         return row
