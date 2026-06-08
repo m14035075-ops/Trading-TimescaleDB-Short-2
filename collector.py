@@ -169,8 +169,13 @@ RECONNECT_GAP_SEC = int(os.getenv("RECONNECT_GAP_THRESHOLD_SEC", "60"))
 
 
 def seed_last_cum_vol(pool: ConnectionPool) -> None:
-    """v7 FIX (Gemini): exchange filter + DISTINCT ON (exchange, symbol)
-    ताकि idx_ticks_ex_sym_ts का proper use हो — startup पर seq-scan नहीं।"""
+    """
+    v7 FIX (Gemini): exchange filter + DISTINCT ON (exchange, symbol)
+                     ताकि idx_ticks_ex_sym_ts का proper use हो (no seq-scan)।
+    v8 SELF-AUDIT FIX (CRITICAL): _LAST_TICK_TS भी seed करो — पहले reconnect
+    detection collector-restart पर काम ही नहीं कर रहा था (prev_ts=None →
+    branch skip → cumulative spike on first post-restart tick)।
+    """
     sql = """
         SELECT DISTINCT ON (exchange, symbol) symbol, volume, ts
         FROM   ticks
@@ -185,7 +190,8 @@ def seed_last_cum_vol(pool: ConnectionPool) -> None:
             for sym, vol, ts in cur.fetchall():
                 _LAST_CUM_VOL[sym]  = int(vol)
                 _LAST_TICK_DAY[sym] = ts.astimezone(IST).date()
-        log.info("seeded last_cum_vol+day for %d symbols", len(_LAST_CUM_VOL))
+                _LAST_TICK_TS[sym]  = ts        # v8 FIX: seed prev_ts
+        log.info("seeded last_cum_vol+day+ts for %d symbols", len(_LAST_CUM_VOL))
     except Exception as e:                                      # noqa: BLE001
         log.warning("seed_last_cum_vol failed: %s", e)
 

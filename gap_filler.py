@@ -206,6 +206,10 @@ def date_range(d_start: date, d_end: date) -> Iterator[date]:
 
 
 def gap_overlaps_market_hours(start: datetime, end: datetime, client=None) -> bool:
+    """
+    Gap window में कोई trading-day market-hours overlap है या नहीं।
+    v8 SELF-AUDIT: अब actually use हो रहा है — fill_one_gap में strict check।
+    """
     start_ist = start.astimezone(IST)
     end_ist   = end.astimezone(IST)
     cur_day = start_ist.date()
@@ -384,13 +388,18 @@ def fetch_history_chunked(client, symbol: str,
 def fill_one_gap(client, pool, gid: int, start: datetime, end: datetime,
                  symbols: list[str]) -> tuple[int, list[str], str | None]:
     """
-    v5 FIX: failure ONLY when API actually errored (failed_days non-empty)。
-    0-rows + no API error = success (e.g. 15:25-15:35 — after-close, no data
-    expected; market holiday gap; illiquid stock).
+    Failure logic:
+      • API errored (failed_days non-empty) → failed
+      • 0 rows + market-hours overlap (Nifty 50 active) → failed
+        (v8 SELF-AUDIT: revived gap_overlaps_market_hours check; ChatGPT
+        round-6 raised this as "ML data quality" concern — silent 0-row
+        success was hiding broker timestamp/symbol mismatches)
+      • 0 rows + after-hours/holiday-only gap → success (no data expected)
     """
     inserted = 0
     failed: list[str] = []
     last_err: str | None = None
+    market_gap = gap_overlaps_market_hours(start, end, client)
 
     for sym in symbols:
         rows, failed_days = fetch_history_chunked(client, sym, start, end)
@@ -402,8 +411,15 @@ def fill_one_gap(client, pool, gid: int, start: datetime, end: datetime,
             continue
 
         if not rows:
-            log.debug("gap %d | %s: 0 bars (no API error — likely after-hours/holiday)",
-                      gid, sym)
+            if market_gap:
+                # v8: market-hours में Nifty 50 stocks का 0-rows = suspicious
+                failed.append(sym)
+                last_err = (f"0 bars in market-hours gap for {sym} "
+                            f"(broker data delay / symbol mismatch?)")
+                log.warning("gap %d | %s: 0 bars in market-hours window", gid, sym)
+            else:
+                log.debug("gap %d | %s: 0 bars (after-hours/holiday only — OK)",
+                          gid, sym)
             continue
 
         try:

@@ -1,9 +1,17 @@
-# NSE Tick Collector — Hindi गाइड (v7)
+# NSE Tick Collector — Hindi गाइड (v8)
 
 > 50 भारतीय शेयरों का **live tick data** OpenAlgo WebSocket से उठाकर अपने ही
 > server के **TimescaleDB** में store करने वाला production-grade project।
-> v7 में ChatGPT + Gemini + Qwen + Kimi के **6 rounds का review** लागू है —
-> कुल **76+ bugs fix**।
+> v8 = 6 review rounds + **self-audit** के total **78 fixes**।
+
+---
+
+## v8 self-audit fixes (मैं ने खुद मिले 2 bugs)
+
+| # | Bug                                                               | Severity | Fix |
+|---|-------------------------------------------------------------------|----------|-----|
+| 1 | **`_LAST_TICK_TS` startup पर seed नहीं होता** — v7 reconnect-spike fix collector-restart पर bypass हो जाता था (prev_ts=None → branch skip → cumulative spike) | 🔴 CRITICAL | `seed_last_cum_vol` अब `_LAST_TICK_TS[sym] = ts` भी set करता है |
+| 2 | **`gap_overlaps_market_hours` dead code** — defined but unused since v6, ML data quality concern | 🟡 MEDIUM | Revived in `fill_one_gap`: market-hours overlap में 0-rows = failure (Nifty 50 active stocks में broker mismatch detect करता है) |
 
 ---
 

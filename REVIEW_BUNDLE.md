@@ -1,24 +1,21 @@
-# NSE Tick Collector — Full Code Review Bundle (v7)
+# NSE Tick Collector — Full Code Review Bundle (v8 — self-audit)
 
 > **For ChatGPT / Gemini / Claude / Qwen / Kimi reviewers:**
-> यह **v7** है — round-1 (12) + round-2 (15) + round-3 (10) + round-4 (20) + round-5 (10) + round-6 (9) = **76 review issues fixed**।
+> v8 = 6 review rounds + my own self-audit = **78 review issues fixed**।
 >
-> **v7 round-6 के prominent changes:**
-> - `fetch_history`: explicit broker JSON-error detection (status/error/errorMessage)
-> - `get_last_db_tick_ts`: NULL trap fix (`WHERE max_ts IS NOT NULL`)
-> - SQL queries: `WHERE exchange = %s` + `DISTINCT ON (exchange, symbol)` for index utilization
-> - `df_rows_in_window`: NaN volume isolated (OHLC preserved); numeric epoch ts handled
-> - `compute_tick_volume`: same-day reconnect spike fix via `_LAST_TICK_TS` + `RECONNECT_GAP_THRESHOLD_SEC`
-> - `_clean_json()` recursive NaN/Inf sanitizer before JSONB insert
-> - Schema UPDATE in DO block (no table lock on idempotent re-runs)
-> - Holiday API unexpected-type warning
+> **v8 self-audit के 2 fixes:**
+> - **CRITICAL:** `_LAST_TICK_TS` collector-startup पर seed नहीं हो रहा था — v7
+>   का reconnect-spike fix collector-restart scenario पर bypass हो जाता था।
+>   अब `seed_last_cum_vol` में जोड़ा।
+> - **MEDIUM:** `gap_overlaps_market_hours()` dead code था (v6 में disconnect
+>   हुआ); अब `fill_one_gap` में revived — market-hours में 0-rows = failure
+>   (Nifty 50 stocks पर broker symbol/timestamp mismatch अब detect होगा)।
 >
 > **Verify:**
-> 1. `_LAST_TICK_TS` thread-safety (mutated inside _VOL_LOCK)
-> 2. RECONNECT_GAP_THRESHOLD_SEC=60 — low-liquidity stocks में false positives?
-> 3. JSON error detection — broker variations (`status`, `error`, `errorMessage`) covered?
-> 4. NaN sanitizer recursion depth — payload size limits?
-> 5. SQL queries with index hints — verify EXPLAIN plan
+> 1. seed_last_cum_vol अब `_LAST_TICK_TS` भी set करता है — collector-restart
+>    के बाद first tick पर reconnect detection actually fire करेगा?
+> 2. fill_one_gap का strict mode — illiquid Nifty-50 edge cases?
+> 3. Mid-day reconnect within 60s threshold — false negative possible?
 
 ---
 
@@ -250,7 +247,7 @@ ORDER  BY ts, exchange, symbol,
 
 ---
 
-## File 2 of 8 — `collector.py`  (902 lines)
+## File 2 of 8 — `collector.py`  (908 lines)
 
 ```python
 """
@@ -424,8 +421,13 @@ RECONNECT_GAP_SEC = int(os.getenv("RECONNECT_GAP_THRESHOLD_SEC", "60"))
 
 
 def seed_last_cum_vol(pool: ConnectionPool) -> None:
-    """v7 FIX (Gemini): exchange filter + DISTINCT ON (exchange, symbol)
-    ताकि idx_ticks_ex_sym_ts का proper use हो — startup पर seq-scan नहीं।"""
+    """
+    v7 FIX (Gemini): exchange filter + DISTINCT ON (exchange, symbol)
+                     ताकि idx_ticks_ex_sym_ts का proper use हो (no seq-scan)।
+    v8 SELF-AUDIT FIX (CRITICAL): _LAST_TICK_TS भी seed करो — पहले reconnect
+    detection collector-restart पर काम ही नहीं कर रहा था (prev_ts=None →
+    branch skip → cumulative spike on first post-restart tick)।
+    """
     sql = """
         SELECT DISTINCT ON (exchange, symbol) symbol, volume, ts
         FROM   ticks
@@ -440,7 +442,8 @@ def seed_last_cum_vol(pool: ConnectionPool) -> None:
             for sym, vol, ts in cur.fetchall():
                 _LAST_CUM_VOL[sym]  = int(vol)
                 _LAST_TICK_DAY[sym] = ts.astimezone(IST).date()
-        log.info("seeded last_cum_vol+day for %d symbols", len(_LAST_CUM_VOL))
+                _LAST_TICK_TS[sym]  = ts        # v8 FIX: seed prev_ts
+        log.info("seeded last_cum_vol+day+ts for %d symbols", len(_LAST_CUM_VOL))
     except Exception as e:                                      # noqa: BLE001
         log.warning("seed_last_cum_vol failed: %s", e)
 
@@ -1159,7 +1162,7 @@ if __name__ == "__main__":
 
 ---
 
-## File 3 of 8 — `gap_filler.py`  (501 lines)
+## File 3 of 8 — `gap_filler.py`  (517 lines)
 
 ```python
 """
@@ -1370,6 +1373,10 @@ def date_range(d_start: date, d_end: date) -> Iterator[date]:
 
 
 def gap_overlaps_market_hours(start: datetime, end: datetime, client=None) -> bool:
+    """
+    Gap window में कोई trading-day market-hours overlap है या नहीं।
+    v8 SELF-AUDIT: अब actually use हो रहा है — fill_one_gap में strict check।
+    """
     start_ist = start.astimezone(IST)
     end_ist   = end.astimezone(IST)
     cur_day = start_ist.date()
@@ -1548,13 +1555,18 @@ def fetch_history_chunked(client, symbol: str,
 def fill_one_gap(client, pool, gid: int, start: datetime, end: datetime,
                  symbols: list[str]) -> tuple[int, list[str], str | None]:
     """
-    v5 FIX: failure ONLY when API actually errored (failed_days non-empty)。
-    0-rows + no API error = success (e.g. 15:25-15:35 — after-close, no data
-    expected; market holiday gap; illiquid stock).
+    Failure logic:
+      • API errored (failed_days non-empty) → failed
+      • 0 rows + market-hours overlap (Nifty 50 active) → failed
+        (v8 SELF-AUDIT: revived gap_overlaps_market_hours check; ChatGPT
+        round-6 raised this as "ML data quality" concern — silent 0-row
+        success was hiding broker timestamp/symbol mismatches)
+      • 0 rows + after-hours/holiday-only gap → success (no data expected)
     """
     inserted = 0
     failed: list[str] = []
     last_err: str | None = None
+    market_gap = gap_overlaps_market_hours(start, end, client)
 
     for sym in symbols:
         rows, failed_days = fetch_history_chunked(client, sym, start, end)
@@ -1566,8 +1578,15 @@ def fill_one_gap(client, pool, gid: int, start: datetime, end: datetime,
             continue
 
         if not rows:
-            log.debug("gap %d | %s: 0 bars (no API error — likely after-hours/holiday)",
-                      gid, sym)
+            if market_gap:
+                # v8: market-hours में Nifty 50 stocks का 0-rows = suspicious
+                failed.append(sym)
+                last_err = (f"0 bars in market-hours gap for {sym} "
+                            f"(broker data delay / symbol mismatch?)")
+                log.warning("gap %d | %s: 0 bars in market-hours window", gid, sym)
+            else:
+                log.debug("gap %d | %s: 0 bars (after-hours/holiday only — OK)",
+                          gid, sym)
             continue
 
         try:
@@ -1667,7 +1686,7 @@ if __name__ == "__main__":
 
 ---
 
-## File 4 of 8 — `requirements.txt`
+## File: `requirements.txt`
 
 ```
 openalgo>=2.0.0
@@ -1679,9 +1698,9 @@ pandas>=2.0.0
 
 ---
 
-## File 5 of 8 — `.env.example`
+## File: `.env.example`
 
-```bash
+```
 # NSE Tick Collector — .env template (v5)
 #
 # नोट: comments अलग lines में रखें — systemd EnvironmentFile inline-comments
@@ -1731,7 +1750,7 @@ LOG_LEVEL=INFO
 
 ---
 
-## File 6 of 8 — `symbols.txt`
+## File: `symbols.txt`
 
 ```
 # Nifty 50 — एक symbol per line, '#' से शुरू होने वाली lines comment हैं।
@@ -1790,7 +1809,7 @@ SHRIRAMFIN
 
 ---
 
-## File 7 of 8 — `.gitignore`
+## File: `.gitignore`
 
 ```
 .env
@@ -1802,15 +1821,23 @@ __pycache__/
 
 ---
 
-## File 8 of 8 — `README.md`
+## File: `README.md`
 
 ````markdown
-# NSE Tick Collector — Hindi गाइड (v7)
+# NSE Tick Collector — Hindi गाइड (v8)
 
 > 50 भारतीय शेयरों का **live tick data** OpenAlgo WebSocket से उठाकर अपने ही
 > server के **TimescaleDB** में store करने वाला production-grade project।
-> v7 में ChatGPT + Gemini + Qwen + Kimi के **6 rounds का review** लागू है —
-> कुल **76+ bugs fix**।
+> v8 = 6 review rounds + **self-audit** के total **78 fixes**।
+
+---
+
+## v8 self-audit fixes (मैं ने खुद मिले 2 bugs)
+
+| # | Bug                                                               | Severity | Fix |
+|---|-------------------------------------------------------------------|----------|-----|
+| 1 | **`_LAST_TICK_TS` startup पर seed नहीं होता** — v7 reconnect-spike fix collector-restart पर bypass हो जाता था (prev_ts=None → branch skip → cumulative spike) | 🔴 CRITICAL | `seed_last_cum_vol` अब `_LAST_TICK_TS[sym] = ts` भी set करता है |
+| 2 | **`gap_overlaps_market_hours` dead code** — defined but unused since v6, ML data quality concern | 🟡 MEDIUM | Revived in `fill_one_gap`: market-hours overlap में 0-rows = failure (Nifty 50 active stocks में broker mismatch detect करता है) |
 
 ---
 
@@ -2059,6 +2086,4 @@ Trading-TimescaleDB-Short-2/
 बस — market hours में `collector.py` चलाते रहें; production-grade tick data रोज़ का इकट्ठा होता रहेगा।
 ````
 
----
-
-## End of bundle — Total: 8 files, 1983 lines.
+## End of bundle — Total: 2013 lines.
